@@ -1,3 +1,3 @@
 [submodule "vendor/GPT-SoVITS"]
-	path = vendor/GPT-SoVITS
+	path = projects/voice-cloning/vendor/GPT-SoVITS
 	url = https://github.com/RVC-Boss/GPT-SoVITS.git

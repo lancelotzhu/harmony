@@ -5,22 +5,22 @@ dist/
 build/
 .eggs/
 
-data/raw/*
-data/sliced/*
-data/denoised/*
-data/asr_output/*
-data/.markers/
-!data/*/.gitkeep
+projects/*/data/raw/*
+projects/*/data/sliced/*
+projects/*/data/denoised/*
+projects/*/data/asr_output/*
+projects/*/data/.markers/
+!projects/*/data/*/.gitkeep
 
-models/pretrained/*
-models/trained/*
-!models/*/.gitkeep
+projects/*/models/pretrained/*
+projects/*/models/trained/*
+!projects/*/models/*/.gitkeep
 
-output/*
-!output/.gitkeep
+projects/*/output/*
+!projects/*/output/.gitkeep
 
-logs/*
-!logs/.gitkeep
+projects/*/logs/*
+!projects/*/logs/.gitkeep
 
 *.wav
 *.mp3
