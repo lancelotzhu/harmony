@@ -7,6 +7,7 @@
 | 子项目 | 说明 |
 | --- | --- |
 | [voice-cloning](projects/voice-cloning/README.md) | 基于 GPT-SoVITS 的声音复刻、语音合成与模型训练 |
+| [qwen-mlx-finetune](projects/qwen-mlx-finetune/README.md) | 在 Apple Silicon 上对 Qwen3.5-0.8B 做 LoRA 微调，导出可供 oMLX 导入的量化 MLX 模型 |
 
 ## 开始使用
 

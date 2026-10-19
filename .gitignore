@@ -11,16 +11,29 @@ projects/*/data/denoised/*
 projects/*/data/asr_output/*
 projects/*/data/.markers/
 !projects/*/data/*/.gitkeep
+projects/*/data/incoming/*
+projects/*/data/processed/*
+!projects/*/data/incoming/.gitkeep
+!projects/*/data/processed/.gitkeep
 
 projects/*/models/pretrained/*
 projects/*/models/trained/*
 !projects/*/models/*/.gitkeep
+projects/*/models/adapters/*
+projects/*/models/fused/*
+projects/*/models/mlx/*
+!projects/*/models/adapters/.gitkeep
+!projects/*/models/fused/.gitkeep
+!projects/*/models/mlx/.gitkeep
 
 projects/*/output/*
 !projects/*/output/.gitkeep
 
 projects/*/logs/*
 !projects/*/logs/.gitkeep
+
+projects/*/data/*.jsonl
+projects/*/data/*.jsonl.*
 
 *.wav
 *.mp3
