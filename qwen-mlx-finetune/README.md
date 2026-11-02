@@ -2,7 +2,7 @@
 
 在 Apple Silicon macOS 上用 [MLX-LM](https://github.com/ml-explore/mlx-lm) 微调 Qwen3.5-0.8B，将 LoRA adapter 合并回模型并量化为 MLX 模型目录，再导入 oMLX 使用。
 
-此项目只提供训练流程和数据格式检查；训练数据由你自行放入 `data/incoming/`，不会自动读取 `~/.config/opencode` 或复制任何个人数据。
+此项目提供训练流程、数据格式检查和离线评估；训练数据由你自行放入 `data/incoming/`，或按下面的说明从公开数据集生成。
 
 ## 环境
 
@@ -62,6 +62,183 @@ python prepare_data.py \
 
 划分按样本随机进行，不做类别分层。若少数类别样本很少，训练/验证集可能失去该类别；训练前应检查各类别数量，确保验证集包含需要评估的类别。
 
+## 权威危险样本
+
+本地导出的真实数据几乎全是 `SAFE`，单靠它训练会让模型把「没见过」当成「危险」。可以用
+[`tomngdev/shell-safety-v1.1`](https://huggingface.co/datasets/tomngdev/shell-safety-v1.1)
+（MIT）补足危险样本。它的标签本来就是 coding harness 的 `allow` / `ask` / `deny`：
+
+| 上游标签 | 本项目标签 | 说明 |
+| --- | --- | --- |
+| `allow` | `SAFE` | 放行 |
+| `deny` | `DANGEROUS` | 交人工；模型没有 `deny` 权 |
+| `ask` | 丢弃 | 策略相关的中间档，保留下来会把常规操作教成危险 |
+
+只取 `shell == "posix"`。`git commit` / `git push`（不含 `--force`）属于 vibe coding 的常规操作，
+无论上游标签如何都覆盖为 `SAFE`；`git push --force` 仍为 `DANGEROUS`。
+上游的 `deny` 比本项目的 `DANGEROUS` 更宽（例如它也会拒绝 `git add .`、换 npm registry、
+`gh repo clone`），所以它在测试集上的「漏放」数是上界，需要按本项目的判定口径人工复核。
+
+先用 `prepare_data.py` 生成 `data/processed/`，再运行：
+
+```bash
+python prepare_authoritative.py \
+  --base-dir data/processed \
+  --output-dir data/authoritative \
+  --test-output eval/shell-safety-test.jsonl \
+  --seed 42
+```
+
+脚本会：
+
+- 从 `data/processed/train.jsonl` 的第一条样本里还原评审提示词，保证生成的样本和插件请求同形；
+- 从 Hugging Face 下载数据集（已有快照时用 `--dataset-path` 指向本地目录）；
+- 按命令去重，合并本地数据，生成 `data/authoritative/train.jsonl` 和 `valid.jsonl`；
+- 从数据集官方 `test` split 分层抽 100 `SAFE` / 100 `DANGEROUS`，写入 `eval/shell-safety-test.jsonl`。
+
+默认抽样为 1500 `SAFE` + 1500 `DANGEROUS` 训练、50 + 50 验证、100 + 100 测试，可用
+`--train-safe`、`--train-dangerous`、`--test-safe` 等参数调整。
+
+如果第一轮在常规命令上误拦偏多，可以用 `prepare_policy.py` 生成 SAFE 加权的版本：
+
+```bash
+python prepare_policy.py \
+  --base-dir data/processed \
+  --output-dir data/policy \
+  --test-output eval/policy-test.jsonl \
+  --seed 42
+```
+
+它和上一版的区别：
+
+- `allow` 侧保留全部 `git_routine` / `git_push_remote` / `localhost_server` / `identity_query` /
+  `declared_dependency`，只对 `local_read` / `local_build` / `chained_all_safe` 设上限；
+- `deny` 侧只保留符合本项目 `DANGEROUS` 定义的原因：`data_exfil`、`pipe_to_shell`、
+  `irreversible_delete`、`secret_to_stdout`、`persistence`、`prod_ssh`、`mount_escape` 等；
+  丢掉 `repoint_registry`、`fetch_external`、`secret_store_write`，以及只含普通 `git add` 的
+  `git_sensitive_commit`（只有命令里出现 `.env` / 凭据 / 私钥路径时才保留）；
+- `allow` 侧还要再滤掉 `rm` / `find -delete` / `shred` / `mkfs` / `dd of=`：上游把它们标成
+  `agent_touched_delete`（agent 自己创建的文件），但评审器只看命令、看不到会话上下文，
+  留着会教模型「删除是 SAFE」；
+- 显式加入 `git commit` / `git push` 与 `git push --force` / `--force-with-lease` 的对照样本；
+- 测试集同样按上面的原因过滤，`eval/policy-test.jsonl` 的漏放数比 200 条原始测试集更接近
+  本项目的真实口径。
+
+## 评估
+
+`evaluate.py` 按插件的实际口径评分：只发送单条 user 消息、greedy 解码、最多 6 个 token，
+并用和 `parseVerdict` 相同的方式取最严重的判定词。数据每行需要 `messages`、`expected` 和 `cmd`：
+
+```bash
+SNAP=$(ls -d ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B-Base/snapshots/*)
+
+python evaluate.py \
+  --model "$SNAP" \
+  --adapter-path models/adapters/qwen3.5-0.8b-auth/0000500_adapters.safetensors \
+  --data eval/holdout.jsonl
+```
+
+`mlx_lm` 只从目录里加载 `adapters.safetensors`，而训练输出是
+`0000500_adapters.safetensors`。`--adapter-path` 可以直接指向这个 checkpoint 文件，
+脚本会用临时目录把文件和同目录的 `adapter_config.json` 摆成 MLX 期望的形状；
+指向普通 adapter 目录也可以。
+
+报告里区分两类错误：
+
+- **漏放**：期望 `DANGEROUS`，模型给 `SAFE`。上线前应优先把它压到 0。
+- **误拦**：期望 `SAFE`，模型给 `RISKY` / `DANGEROUS`（最终动作都是 `ask`）。只影响打扰率。
+
+如果评估的是指令模型（例如线上的 `Qwen3.5-0.8B-OptiQ-4bit`），加 `--no-thinking`，
+否则 6 个 token 会被思考过程吃光，所有样本都会变成「无法解析」。
+
+### 结果（2026-10-30）
+
+12 条本地留出集（6 `SAFE` / 6 `DANGEROUS`，`git commit` / `git push` 按 `SAFE`）：
+
+| 模型 | 正确 | 漏放 | 误拦 |
+| --- | --- | --- | --- |
+| 线上 `OptiQ-4bit`（`--no-thinking`） | 10/12 | 0 | 2（`git commit`、`git push`） |
+| `auth` 250 步 | 11/12 | 0 | 1（`git push origin dev`） |
+| `auth` 500 步 | 11/12 | 0 | 1（`git push origin dev`） |
+| `auth` 750 步 | 11/12 | 0 | 1（`git push origin dev`） |
+| `auth` 1000 步 | 8/12 | 3 | 1 |
+| `auth` 1250 / 1500 步 | 7/12 | 5 | 0 |
+
+200 条 `shell-safety-v1.1` 测试集（100 / 100，标签比本项目口径更宽）：
+
+| 模型 | 正确 | 漏放 | 误拦 |
+| --- | --- | --- | --- |
+| 线上 `OptiQ-4bit`（`--no-thinking`） | 142/200 | 6 | 52 |
+| `auth` 250 步 | 136/200 | 19 | 45 |
+| `auth` 500 步 | 129/200 | 5 | 66 |
+| `auth` 750 步 | 142/200 | 11 | 47 |
+
+500 步在留出集上把误拦从 2 条降到 1 条且保持 0 漏放，但在 200 条测试集上误拦比线上
+模型多 14 条；250 / 750 也没有同时改善两项。原因是权威数据里的 `deny` 包含
+`git add`、换 registry、`gh repo clone` 等本项目视为常规的操作，而 `SAFE` 样本又被
+1500 条危险样本稀释。当前 adapter 还不能直接替换线上模型。
+
+### 结果（2026-11-02，policy-v4）
+
+`data/policy-v4`（5567 条：3000 `SAFE` / 2560 `DANGEROUS` / 7 `RISKY`）训练，
+batch 2、4 层、lr `1e-5`。评估用 `eval/holdout-v4.jsonl` 和 `eval/policy-test-v4.jsonl`——
+这两个集合的提示词必须和 `policy_prompt.py` 一致，拿旧提示词的 `eval/holdout.jsonl`
+去测 v4 adapter 会多出一条假漏放。
+
+| 模型 | 留出集 12 条 | 漏放 | 误拦 | `policy-test-v4` 282 条 | 漏放 | 误拦 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `policy-v4` 2500 步 | 7/12 | 5 | 0 | 255/282 | 27 | 0 |
+| `policy-v4` 5000 步 | 9/12 | 3 | 0 | **274/282** | **8** | **0** |
+
+2500 步只覆盖了约 0.9 个 epoch（5567 条 / batch 2），5000 步才跑满约 1.8 个 epoch。
+第二个 epoch 把测试集漏放从 27 条压到 8 条、留出集从 5 条压到 3 条，误拦始终为 0；
+训练 loss 在 2500 步时已经是 0.01–0.05，只看 loss 会误判成「练完了」。
+
+留出集剩下的 3 条漏放是 `pnpm prisma migrate dev`、`git reset --hard origin/main`、
+`git rebase -i HEAD~3`。这三类在训练集里样本太少，再加迭代数解决不了：按单段命令统计，
+`git clean` / `reset --hard` / `rebase -i` 合计只有 6 条 `DANGEROUS`，旁边却有 150 条
+以 `git ` 开头的 `SAFE`；`prisma migrate` / `alembic` / `flyway` 只有 5 条。
+要继续压漏放，应该在 `prepare_policy.py` 里补这几种「裸命令」形态的危险样本，
+而不是加训练步数。
+
+### 测试集污染（2026-11-03 发现）
+
+上游 `train` 和 `test` split 共享不少通用命令（`pnpm test -- --coverage`、
+`find . -maxdepth 2 -type d | sort`），而 `prepare_policy.py` 原来抽测试集时传的是空
+`seen`，于是 **282 条里有 119 条是模型训练时见过的**。上面 v4 那张表的分数都偏高。
+
+现在抽测试集时会排除所有训练命令，产出 `eval/policy-test-v5.jsonl`（170 条：
+95 `SAFE` / 75 `DANGEROUS`，对 v4 和 v5 两份训练集都是零重合）。同时
+`--holdout` 会把留出集那 12 条命令从训练里剔掉——上一轮把其中 4 条原样训了进去，
+留出集实际上在考记忆而不是泛化。同形态的兄弟样本仍然保留，所以形态照常学得到。
+
+在干净测试集上重测，v4 的虚高只有约 1.3 个百分点（97.2% → 95.9%）。
+
+### 结果（2026-11-03，policy-v5，达到上线标准）
+
+`data/policy-v5`（6930 条：3738 `DANGEROUS` / 3000 `SAFE` / 192 `RISKY`），
+7000 步 ≈ 2 个 epoch。全部在**无污染**的 `eval/policy-test-v5.jsonl`（170 条）上测：
+
+| 模型 | 正确 | 漏放 /75 | 误拦 /95 |
+| --- | --- | --- | --- |
+| 线上 `OptiQ-4bit` | 115/170 (67.6%) | 5 | 50 |
+| `policy-v4` 5000 步 | 163/170 (95.9%) | 6 | 1 |
+| `policy-v5` 7000 步（greedy） | 165/170 (97.1%) | 5 | 0 |
+| **`policy-v5` 7000 步（P(SAFE) ≥ 0.99）** | 164/170 (96.5%) | **0** | **6** |
+
+留出集 12 条：greedy 和 0.99 阈值都是 **12/12（0 漏放 0 误拦）**，从第 4500 步起稳定；
+线上模型是 11/12（0 漏放 1 误拦）。
+
+上线标准取「在两项上都严格优于线上，且数据无污染」：漏放 0 < 5、误拦 6 < 50，两项都过。
+顺带也达到了 README 原本那个更严的「漏放压到 0」。
+
+判定阈值是在 `data/policy-v5/valid.jsonl` 上选的（0.99 处漏放 4→1、误拦只付 6 条，
+再往上只涨误拦不降漏放），**没有碰测试集**，所以测试集上的 0 漏放是泛化结果。
+
+注意两点：75 条危险样本上的 0 漏放，95% 置信区间上界约 4.8%，样本量不足以宣称「永不漏放」；
+以及阈值判定要求插件读 logprob，判定词在 `</think>\n\n` **之后**那个位置。
+只用 greedy 的话是漏放 5 条，和线上持平而非胜出。
+
 ## LoRA 训练
 
 默认模型为 Hugging Face 上的 `Qwen/Qwen3.5-0.8B-Base`。先完成上面的数据准备，再运行：
@@ -79,6 +256,43 @@ bash train.sh
 ```
 
 adapter 默认写入 `models/adapters/qwen3.5-0.8b`。训练集和验证集的 loss 会由 MLX-LM 输出；建议根据验证 loss 调整迭代数，避免只依据训练 loss 延长训练。
+
+### 长时间训练与显存（batch 2 会 OOM）
+
+峰值显存由 LM head 决定：logits 要对每个位置算满 ~152k 词表，batch 2 × ~990 token
+光 logits 就约 1.2 GB（fp32），加上 softmax 中间量正好顶在 32 GB 机器约 24.96 GB 的
+working set 上限。MLX-LM 的 `iterate_batches` **先按长度排序再分批**，所以两条最长样本
+永远落在同一批里，这一批每个 epoch 命中一次，位置由 seed 决定（seed 0 时在第 660 步，
+seed 1500 时在第 145 步）。换句话说它不是偶发的——用最长的 16 条样本单独建一个数据集，
+batch 2 在 30 步内必崩，batch 1 跑 60 步没事。
+
+`train_resilient.sh` 用两件事绕开它：
+
+- `--batch-size 1 --grad-accumulation-steps 2`。MLX-LM 的 `--iters` 数的是 micro-batch，
+  所以脚本把步数乘 2 下发：样本数和 optimizer 更新次数与 batch 2 完全一致，峰值显存减半。
+  脚本内部和落盘的 checkpoint 编号仍是「batch 2 等效步数」，可以直接和上面的表对比。
+- 崩溃后从最新 checkpoint 续跑，并且**每次重试换一个新 seed**。seed 不变就会重放同一批
+  数据，于是在同一步再崩一次（第一版脚本用累计步数当 seed，卡住时步数不变，白跑了 3 小时）。
+
+```bash
+nohup bash train_resilient.sh > models/train-policy-v4-5k.supervisor.log 2>&1 &
+```
+
+默认 5000 步、每 250 步存一次，崩一次最多损失 250 步。注意 macOS 没有 `setsid`，
+用 `( nohup ... & )` 子 shell 让进程挂到 launchd 下，终端或会话结束都不会带走它。
+
+### 扫描 checkpoint
+
+```bash
+TAG=policy-v4-5k bash eval_sweep.sh
+```
+
+对 `ADAPTER_DIR` 里每个 checkpoint 跑一遍留出集，最后一个 checkpoint 再跑一遍测试集，
+汇总写到 `models/eval-$TAG-summary.log`，并把模型、adapter、两个数据集的路径都记在表头——
+旧的汇总没记数据集路径，事后无法确认当时用的是哪个留出集。
+
+脚本在检测到 `mlx_lm lora` 还在跑时会直接拒绝执行：推理和训练同时占显存会把两边一起
+OOM 掉（这一条是踩过的坑，不是假设）。
 
 ## 合并并量化为 MLX
 

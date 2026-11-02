@@ -4,6 +4,7 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_DIR"
 
+PYTHON="${PYTHON:-$([[ -x "$PROJECT_DIR/.venv/bin/python" ]] && echo "$PROJECT_DIR/.venv/bin/python" || echo python)}"
 MODEL="${MODEL:-Qwen/Qwen3.5-0.8B-Base}"
 ADAPTER_PATH="${ADAPTER_PATH:-models/adapters/qwen3.5-0.8b}"
 FUSED_PATH="${FUSED_PATH:-models/fused/qwen3.5-0.8b-lora}"
@@ -24,12 +25,12 @@ fi
 
 mkdir -p "$(dirname "$FUSED_PATH")" "$(dirname "$MLX_PATH")"
 
-python -m mlx_lm fuse \
+"$PYTHON" -m mlx_lm fuse \
   --model "$MODEL" \
   --adapter-path "$ADAPTER_PATH" \
   --save-path "$FUSED_PATH"
 
-python -m mlx_lm convert \
+"$PYTHON" -m mlx_lm convert \
   --hf-path "$FUSED_PATH" \
   --mlx-path "$MLX_PATH" \
   --quantize \

@@ -1,0 +1,16 @@
+# 训练数据与模型产物保留在本机，不进入版本库
+data/incoming/*.jsonl
+data/processed/*.jsonl
+data/authoritative/
+data/balanced/
+data/relabeled/
+data/policy*/
+eval/
+
+models/adapters/*
+!models/adapters/.gitkeep
+models/fused/*
+!models/fused/.gitkeep
+models/mlx/*
+!models/mlx/.gitkeep
+models/*.log
