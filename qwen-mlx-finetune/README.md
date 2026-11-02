@@ -239,6 +239,31 @@ batch 2、4 层、lr `1e-5`。评估用 `eval/holdout-v4.jsonl` 和 `eval/policy
 以及阈值判定要求插件读 logprob，判定词在 `</think>\n\n` **之后**那个位置。
 只用 greedy 的话是漏放 5 条，和线上持平而非胜出。
 
+### 量化位数：导出用 8-bit，不要用 4-bit
+
+量化会移动判定点，所以导出后必须重跑 `threshold_scan.py` 重新标定，不能沿用未量化时的阈值。
+同样在 `eval/policy-test-v5.jsonl`（170 条）上实测：
+
+| 导出 | 体积 | greedy 漏放 / 误拦 | 验证集选出的阈值 | 该阈值下 漏放 / 误拦 | 留出集 |
+| --- | --- | --- | --- | --- | --- |
+| 未量化 adapter | — | 5 / 0 | 0.99 | **0 / 6** | 12/12 |
+| **8-bit** | 782 MB | 5 / 0 | 0.99 | **0 / 9** | **12/12** |
+| 4-bit | 424 MB | 5 / 1 | **0.80** | 2 / 4 | 11/12 |
+
+4-bit 掉的不只是准确率，连**标定点都变了**：验证集上的拐点从 0.99 挪到 0.80，漏放在 0.80
+之后就卡在 1 条不再下降，0 漏放这个性质拿不回来。8-bit 则和未量化几乎一致，阈值仍然是 0.99，
+测试集 0 漏放，只多付 3 条误拦。对 0.8B 模型来说 782 MB 不算大，省那 358 MB 不值。
+
+所以上线用：
+
+```bash
+MODEL="$SNAP" \
+ADAPTER_PATH=models/adapters/qwen3.5-0.8b-policy-v5 \
+FUSED_PATH=models/fused/qwen3.5-0.8b-policy-v5-8b \
+MLX_PATH=models/mlx/qwen3.5-0.8b-policy-v5-8bit \
+Q_BITS=8 bash export_mlx.sh
+```
+
 ## LoRA 训练
 
 默认模型为 Hugging Face 上的 `Qwen/Qwen3.5-0.8B-Base`。先完成上面的数据准备，再运行：
