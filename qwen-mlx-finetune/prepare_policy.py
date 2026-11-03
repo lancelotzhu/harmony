@@ -325,6 +325,31 @@ PIPE_SHELL_AUGMENT = [
 ]
 
 
+# 上游有些 DANGEROUS 行的危险片段只存在于 `#` 注释里，例如
+#   tap --no-coverage && ... # fix lint && >/root/.bashrc
+# bash 里 `#` 之后整行都是注释，`>/root/.bashrc` 根本不会执行，这条命令按本项目
+# 口径是安全的。评审器只看命令文本，把这种样本留在 DANGEROUS 侧，等于教模型
+# 「看见危险字样就报警」而不是「判断会不会真的执行」；留在测试集里则是在用错
+# 标签给模型扣分——v5 剩下的 5 条漏放里就有 2 条是这种。
+#
+# 只剔除「去掉注释后危险片段就消失」的行，不去改写标签：无法确定上游当初是因为
+# 哪一段判的 deny，丢掉比臆测更稳。
+COMMENT_DANGER = re.compile(
+    r"rm\s+-\w*r|>\s*/(?:root|etc|var|boot|dev)/|mkfs|dd\s+[^|]*of=|shred\b|"
+    r"(?:curl|wget)[^|]*\|\s*(?:sudo\s+)?(?:ba)?sh|:\(\)\s*\{",
+    re.I,
+)
+
+
+def danger_only_in_comment(command: str) -> bool:
+    """危险片段只出现在 `#` 之后，也就是永远不会被执行。"""
+    for line in command.split("\n"):
+        code = line.split("#", 1)[0]
+        if COMMENT_DANGER.search(line) and not COMMENT_DANGER.search(code):
+            return True
+    return False
+
+
 def label_for(command: str, upstream: str) -> str:
     if GIT_ROUTINE.search(command) and not GIT_FORCE.search(command):
         return "SAFE"
@@ -372,6 +397,9 @@ def collect(path: Path, seen: set[str], kind: str) -> dict[str, dict]:
             if reason not in DANGEROUS_REASONS and not (
                 reason == "git_sensitive_commit" and SECRET_PATH.search(command)
             ):
+                continue
+            # 危险片段被 `#` 注释掉的行按本项目口径不危险，训练和测试都不要
+            if danger_only_in_comment(command):
                 continue
         if kind == "safe" and unsafe_for_safe_side(command):
             continue
@@ -471,19 +499,40 @@ def main() -> int:
 
     dataset = find_dataset(args.dataset_path)
     rng = random.Random(args.seed)
-    train_safe = stratified(collect(dataset / "train.jsonl", seen, "safe"), SAFE_CAPS, rng)
-    train_danger = stratified(collect(dataset / "train.jsonl", seen, "danger"), DANGEROUS_CAPS, rng)
 
     def take(pool: dict[str, dict], label: str, count: int) -> list[str]:
         commands = sorted(c for c, m in pool.items() if m["label"] == label)
         rng.shuffle(commands)
         return commands[:count]
 
-    valid_pool = collect(dataset / "validation.jsonl", seen, "safe") | collect(
-        dataset / "validation.jsonl", seen, "danger"
+    # ── 先切测试集，再拿剩下的去训练 ──────────────────────────────────
+    #
+    # 上游 train / test split 共享大量通用命令，所以两边必有重合。先建训练集
+    # 再从测试集里剔重合，等于让训练集优先挑走——危险侧 132 条被吃到只剩 75 条，
+    # 而危险侧恰恰是衡量漏放的唯一依据，也是整个评估里最稀缺的资源。
+    #
+    # 反过来先把测试集占住，训练侧只少约 57 条（3738 条里的 1.5%，且这些本来
+    # 就是测试集内容的副本，留着反而是污染），危险测试样本却能回到 132 条。
+    test_safe_pool = collect(dataset / "test.jsonl", seen, "safe")
+    test_danger_pool = collect(dataset / "test.jsonl", seen, "danger")
+    test = [(c, "SAFE") for c in take(test_safe_pool, "SAFE", args.test_safe)]
+    test += [(c, "DANGEROUS") for c in take(test_danger_pool, "DANGEROUS", args.test_dangerous)]
+
+    # 验证集同样要在训练之前占住。阈值是在它上面定的，而上游 train 和
+    # validation split 也共享命令——先建训练集会让验证集里混进 85 条模型背过的
+    # 行（实测），P(SAFE) 分布被背诵拉锐，定出来的阈值系统性偏高。
+    held = seen | {c for c, _ in test}
+    valid_pool = collect(dataset / "validation.jsonl", held, "safe") | collect(
+        dataset / "validation.jsonl", held, "danger"
     )
     valid_safe = take(valid_pool, "SAFE", args.valid_safe)
     valid_danger = take(valid_pool, "DANGEROUS", args.valid_dangerous)
+
+    reserved = held | set(valid_safe) | set(valid_danger)
+
+    train_safe = stratified(collect(dataset / "train.jsonl", reserved, "safe"), SAFE_CAPS, rng)
+    train_danger = stratified(collect(dataset / "train.jsonl", reserved, "danger"), DANGEROUS_CAPS, rng)
+
 
     augment = [(c, "SAFE", "git_augment") for c in GIT_ROUTINE_AUGMENT] + [
         (c, "RISKY", "git_risky_augment") for c in GIT_RISKY_AUGMENT
@@ -497,11 +546,13 @@ def main() -> int:
         (c, "DANGEROUS", "pipe_shell_augment") for c in PIPE_SHELL_AUGMENT
     ]
 
-    # Hold the 12 curated eval commands out of training.  The previous round
-    # trained on them verbatim, which made the hold-out a memorisation check
-    # rather than a generalisation one; siblings of each shape remain in
-    # training, so the shape is still taught.
-    excluded = set()
+    # 从训练里剔掉两类命令:
+    #   1. 留出集那 12 条——上一轮把其中 4 条原样训了进去，留出集就成了考记忆
+    #      而不是考泛化。同形态的兄弟样本保留，形态照常学得到。
+    #   2. 测试集命令——上面的 `reserved` 只挡住了从上游 split 采的部分，
+    #      挡不住这些手写的 augment 字面量。实测它们和测试集撞了 5 条
+    #      （`gcloud auth print-access-token` 之类常见命令），不剔就是污染。
+    excluded = {c for c, _ in test} | set(valid_safe) | set(valid_danger)
     if args.holdout and args.holdout.is_file():
         for row in read_jsonl(args.holdout):
             if row.get("cmd"):
@@ -558,26 +609,25 @@ def main() -> int:
     train = safe_rows + other_rows
     rng.shuffle(train)
 
-    valid = [make_sample(prompt, c, l) for c, l in base_valid] + [
+    # 留出集那 12 条是从本地导出的 valid 切片里挑的，所以它们本来就躺在
+    # `base_valid` 里。阈值在验证集上定、再拿留出集报分就成了循环论证，剔掉。
+    valid = [make_sample(prompt, c, l) for c, l in base_valid if c.strip() not in excluded] + [
         make_sample(prompt, c, "SAFE") for c in valid_safe
     ] + [make_sample(prompt, c, "DANGEROUS") for c in valid_danger]
 
-    # Policy-aligned test: keep all SAFE rows; keep only DANGEROUS rows whose
-    # reason survives the same filter as training.
-    #
-    # The upstream train and test splits share plenty of generic commands
-    # (`pnpm test -- --coverage`, `find . -maxdepth 2 -type d | sort`), so
-    # sampling the test split blind leaves ~40% of rows already memorised and
-    # inflates the score.  Exclude anything the model trained on.
+    # 测试集已在上面切好（见那段「先切测试集」的说明）。这里只做一次保险:
+    # 确认训练集真的没碰过测试命令，有重合就直接报错而不是悄悄算分。
     trained_commands = {c for c, _ in base_train} | {c for c, _, _ in train_extra}
     for row in train:
         match = COMMAND_BLOCK.search(row["messages"][0]["content"])
         if match:
             trained_commands.add(match.group(1))
-    test_safe_pool = collect(dataset / "test.jsonl", trained_commands, "safe")
-    test_danger_pool = collect(dataset / "test.jsonl", trained_commands, "danger")
-    test = [(c, "SAFE") for c in take(test_safe_pool, "SAFE", args.test_safe)]
-    test += [(c, "DANGEROUS") for c in take(test_danger_pool, "DANGEROUS", args.test_dangerous)]
+    leaked = sorted({c for c, _ in test} & trained_commands)
+    if leaked:
+        raise SystemExit(
+            f"测试集有 {len(leaked)} 条命令出现在训练集里，分数会虚高。"
+            f"示例: {leaked[:3]}"
+        )
 
     write_jsonl(args.output_dir / "train.jsonl", train)
     write_jsonl(args.output_dir / "valid.jsonl", valid)
