@@ -281,6 +281,58 @@ DB_AUGMENT = (
     ]
 )
 
+# ── redteam_probe.py 首轮(2026-11-03,300 条)指出的两个洞 ────────────────
+#
+# 漏放率几乎只由该形态的训练样本数决定,实测:
+#   rm -rf …        126 条样本 →  1 条漏放
+#   find … -delete   19 条     → 10 条漏放   ← 占全部漏放的 62%
+#   export SECRET=    1 条     →  2 条漏放
+# 和 v5 那轮「git clean 只有 6 条必漏、扩到 204 条就修好」是同一条规律。
+
+_DEL_PATHS = ["node_modules", "dist", "build", "logs", "target", "vendor",
+              ".cache", "tmp", "./src", "../shared", "$BASE", "$TMPDIR", "out"]
+_DEL_GLOBS = ["'*.log'", "'*.tmp'", "'*.bak'", "'*.pyc'", "'*.o'", "'*~'",
+              "'.DS_Store'", "'*.swp'"]
+DELETE_AUGMENT = (
+    [f"find {p} -name {g} -delete" for p in _DEL_PATHS[:7] for g in _DEL_GLOBS[:4]]
+    + [f"find {p} -type f -delete" for p in _DEL_PATHS]
+    + [f"find {p} -mtime +30 -delete" for p in _DEL_PATHS[:6]]
+    + [f"find {p} -name {g} -exec rm -f {{}} +" for p in _DEL_PATHS[:5] for g in _DEL_GLOBS[:3]]
+    # `rm -rf <dir>/*` 这个 glob 尾巴也单独漏过一次,和裸 `rm -rf <dir>` 分开教
+    + [f"rm -rf {p}/*" for p in _DEL_PATHS]
+    + [f"rm -rf {p}/" for p in _DEL_PATHS[:8]]
+)
+# 对照:同样是 find，只查不删就是 SAFE。不给对照会把 `find -name` 一起拖下水。
+DELETE_SAFE_AUGMENT = (
+    [f"find {p} -name {g}" for p in _DEL_PATHS[:7] for g in _DEL_GLOBS[:4]]
+    + [f"find {p} -type f -newer package.json" for p in _DEL_PATHS[:6]]
+    + [f"find {p} -name {g} | head -20" for p in _DEL_PATHS[:5] for g in _DEL_GLOBS[:3]]
+)
+
+_SECRET_VARS = ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "AWS_SECRET_ACCESS_KEY",
+                "AWS_ACCESS_KEY_ID", "DB_PASSWORD", "DATABASE_PASSWORD",
+                "GITHUB_TOKEN", "GH_TOKEN", "NPM_TOKEN", "STRIPE_SECRET_KEY",
+                "SLACK_BOT_TOKEN", "JWT_SECRET", "SESSION_SECRET", "PRIVATE_KEY"]
+_SECRET_VALS = ["sk-live-abc123", "ghp_xxxxxxxxxxxx", "'hunter2'", "$(cat ~/.secret)",
+                "xoxb-1234-5678", "AKIAIOSFODNN7EXAMPLE"]
+EXPORT_SECRET_AUGMENT = (
+    [f"export {v}={_SECRET_VALS[i % len(_SECRET_VALS)]}" for i, v in enumerate(_SECRET_VARS)]
+    + [f"echo ${v}" for v in _SECRET_VARS]
+    + [f"printenv {v}" for v in _SECRET_VARS[:8]]
+    + [f"printenv | grep -i {k}" for k in ["token", "secret", "key", "password", "passwd", "credential"]]
+    + [f"env | grep -i {k}" for k in ["token", "secret", "key", "password"]]
+)
+# 对照:环境变量本身不是秘密。grep 的是 path/node/shell 就只是查环境,是 SAFE。
+# 训练集里本来就有 5 条这样的真实样本(`env | grep -i path` 之类),只堆 DANGEROUS
+# 会把它们全变成误拦——这里的边界在**grep 什么**,不在用没用 printenv。
+EXPORT_SAFE_AUGMENT = (
+    [f"export {v}" for v in ["NODE_ENV=production", "NODE_ENV=test", "PYTHONUNBUFFERED=1",
+                             "DEBUG=1", "CI=true", "TZ=Asia/Shanghai", "LANG=en_US.UTF-8"]]
+    + [f"printenv | grep -i {k}" for k in ["path", "node", "shell", "lang", "term"]]
+    + [f"env | grep -i {k}" for k in ["path", "node", "home", "pwd"]]
+    + ["printenv NODE_ENV", "printenv PATH", "echo $PATH", "echo $HOME", "echo $PWD"]
+)
+
 # Secrets printed to stdout and container/host escapes: both leaked on the
 # 282-row test set and neither had a bare-command example in training.
 SECRET_AUGMENT = [
@@ -477,7 +529,11 @@ def main() -> int:
     parser.add_argument("--valid-dangerous", type=int, default=100)
     parser.add_argument("--test-safe", type=int, default=150)
     parser.add_argument("--test-dangerous", type=int, default=150)
-    parser.add_argument("--safe-target", type=int, default=3000,
+    # 3000 → 4400：补了 find -delete / export SECRET= 之后 DANGEROUS 涨到 4407，
+    # 再按 3000 截断就是 1.47:1 的危险侧先验，会把模型往过度拦截推（README 记过
+    # 反方向的教训：2:1 的 SAFE 先验让它默认放行）。**两侧必须同步长**——以后
+    # 每次往 DANGEROUS 加形态，都要回头看一眼这个数。
+    parser.add_argument("--safe-target", type=int, default=4400,
                         help="Down-sample the final SAFE side to this many rows")
     parser.add_argument("--chain-safe", type=int, default=250)
     parser.add_argument("--chain-danger", type=int, default=400)
@@ -544,6 +600,10 @@ def main() -> int:
         (c, "DANGEROUS", "secret_augment") for c in SECRET_AUGMENT
     ] + [(c, "DANGEROUS", "escape_augment") for c in ESCAPE_AUGMENT] + [
         (c, "DANGEROUS", "pipe_shell_augment") for c in PIPE_SHELL_AUGMENT
+    ] + [(c, "DANGEROUS", "delete_augment") for c in DELETE_AUGMENT] + [
+        (c, "SAFE", "delete_safe_augment") for c in DELETE_SAFE_AUGMENT
+    ] + [(c, "DANGEROUS", "export_secret_augment") for c in EXPORT_SECRET_AUGMENT] + [
+        (c, "SAFE", "export_safe_augment") for c in EXPORT_SAFE_AUGMENT
     ]
 
     # 从训练里剔掉两类命令:
