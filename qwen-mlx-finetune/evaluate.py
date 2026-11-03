@@ -13,6 +13,7 @@ take the most severe verdict word found.
 import argparse
 import contextlib
 import json
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -46,12 +47,28 @@ def parse_verdict(content: str) -> str | None:
     return max(found, key=VERDICTS.index)
 
 
+COMMAND_BLOCK = re.compile(r"<command>\n(.*)\n</command>", re.S)
+
+
 def read_rows(path: Path) -> list[dict]:
+    """评估集带 `expected` / `cmd`；训练格式的文件（train/valid.jsonl）没有。
+
+    选 checkpoint 必须在验证集上做——拿测试集选型就是用尺子调参。而验证集是
+    训练格式，所以这里把 `expected` 和 `cmd` 从 messages 里还原出来，省得为了
+    选型再维护一份平行的评估集。
+    """
     rows = []
     with path.open(encoding="utf-8") as source:
         for line in source:
-            if line.strip():
-                rows.append(json.loads(line))
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if "expected" not in row:
+                row["expected"] = row["messages"][-1]["content"].strip()
+            if "cmd" not in row:
+                match = COMMAND_BLOCK.search(row["messages"][0]["content"])
+                row["cmd"] = match.group(1) if match else "(无法还原命令)"
+            rows.append(row)
     return rows
 
 

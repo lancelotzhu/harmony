@@ -573,6 +573,11 @@ def main() -> int:
     parser.add_argument("--holdout", type=Path, default=Path("eval/holdout-v4.jsonl"),
                         help="Exclude these commands from training so the set stays "
                              "a generalisation test; pass a missing path to disable")
+    parser.add_argument("--max-tokens", type=int, default=880,
+                        help="丢弃超过这么多 token 的训练/验证样本；0 关闭。"
+                             "实测 batch 2 在 950 token 上必 OOM、900 通过，880 是留了余量的值")
+    parser.add_argument("--tokenizer", default="Qwen/Qwen3.5-0.8B-Base",
+                        help="只用来量长度，要和训练用的基座一致")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -716,6 +721,35 @@ def main() -> int:
             f"测试集有 {len(leaked)} 条命令出现在训练集里，分数会虚高。"
             f"示例: {leaked[:3]}"
         )
+
+    # 砍掉过长样本——这是 Metal OOM 的唯一来源
+    #
+    # 峰值显存由最长的那一批决定：logits 要对每个位置算满 ~152k 词表。mlx-lm
+    # 又是**先按长度排序再分批**，于是最长的几条必然被配成同一批，每个 epoch
+    # 命中一次。v7 那轮 9000 步崩了 26 次，全是这个。
+    #
+    # 实测边界（24 条最长样本反复喂 40 步，batch 2）：
+    #   上限 1020 → OOM     上限 950 → OOM
+    #   上限  900 → 通过    上限 850 → 通过
+    # 取 880 留余量。代价 20 条 / 0.22%，而且 11 危 9 安是平衡的，不引入偏置。
+    #
+    # valid 也要砍：训练中算验证 loss 走的是同一个 `iterate_batches`，同样会崩。
+    # test 不砍——它不参与训练，砍了只会让基准失真。
+    if args.max_tokens:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+
+        def too_long(row: dict) -> bool:
+            text = "".join(m["content"] for m in row["messages"])
+            return len(tokenizer(text)["input_ids"]) > args.max_tokens
+
+        for name, rows in (("train", train), ("valid", valid)):
+            dropped = [r for r in rows if too_long(r)]
+            if dropped:
+                labels = Counter(r["messages"][-1]["content"].strip() for r in dropped)
+                print(f"{name}: 超过 {args.max_tokens} token 丢弃 {len(dropped)} 条 {dict(labels)}")
+            rows[:] = [r for r in rows if not too_long(r)]
 
     write_jsonl(args.output_dir / "train.jsonl", train)
     write_jsonl(args.output_dir / "valid.jsonl", valid)
