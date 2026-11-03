@@ -333,6 +333,34 @@ EXPORT_SAFE_AUGMENT = (
     + ["printenv NODE_ENV", "printenv PATH", "echo $PATH", "echo $HOME", "echo $PWD"]
 )
 
+# 红队第二轮(2026-11-03,400 条)发现的误拦:`pnpm add -D <pkg>` 26 条里错 6 条。
+#
+# 查训练集才看明白:`pnpm add -D` **一条样本都没有**,而裸 `pnpm install` 是
+# 14 条 DANGEROUS / 1 条 SAFE——因为它几乎只作为危险链的尾巴出现
+# (`git clean -fdx && pnpm install`、`git reset --hard && pnpm install`,
+# 正是 v5 为了教「链里有一段危险就危险」而加的对照样本)。
+#
+# 于是模型学到的是「pnpm install 和 DANGEROUS 共现」,而提示词白纸黑字把它列为
+# SAFE——**数据在反驳提示词**。那些链式样本本身没错(链确实危险),缺的是足量的
+# 裸安装样本把共现打平。
+_PKG_MGRS = ["pnpm", "npm", "yarn", "bun"]
+_PKG_NAMES = ["lodash", "react", "axios", "zod", "vitest", "typescript", "eslint",
+              "prettier", "tsx", "date-fns", "clsx", "vite"]
+DEPENDENCY_SAFE_AUGMENT = (
+    [f"{m} install" for m in _PKG_MGRS]
+    + [f"{m} install --frozen-lockfile" for m in _PKG_MGRS[:2]]
+    + [f"{m} ci" for m in ["npm"]]
+    + [f"pnpm add {p}" for p in _PKG_NAMES]
+    + [f"pnpm add -D {p}" for p in _PKG_NAMES]
+    + [f"npm install {p}" for p in _PKG_NAMES[:8]]
+    + [f"npm install --save-dev {p}" for p in _PKG_NAMES[:8]]
+    + [f"yarn add {p}" for p in _PKG_NAMES[:8]]
+    + [f"yarn add --dev {p}" for p in _PKG_NAMES[:6]]
+    + [f"pnpm add -D {a} {b}" for a, b in zip(_PKG_NAMES[:5], _PKG_NAMES[5:10])]
+    + ["pip install -r requirements.txt", "uv pip install -r requirements.txt",
+       "poetry install", "cargo fetch", "go mod download", "bundle install"]
+)
+
 # Secrets printed to stdout and container/host escapes: both leaked on the
 # 282-row test set and neither had a bare-command example in training.
 SECRET_AUGMENT = [
@@ -604,7 +632,7 @@ def main() -> int:
         (c, "SAFE", "delete_safe_augment") for c in DELETE_SAFE_AUGMENT
     ] + [(c, "DANGEROUS", "export_secret_augment") for c in EXPORT_SECRET_AUGMENT] + [
         (c, "SAFE", "export_safe_augment") for c in EXPORT_SAFE_AUGMENT
-    ]
+    ] + [(c, "SAFE", "dependency_safe_augment") for c in DEPENDENCY_SAFE_AUGMENT]
 
     # 从训练里剔掉两类命令:
     #   1. 留出集那 12 条——上一轮把其中 4 条原样训了进去，留出集就成了考记忆
