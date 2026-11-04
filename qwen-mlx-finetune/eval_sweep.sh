@@ -10,6 +10,9 @@ ADAPTER_DIR="${ADAPTER_DIR:-models/adapters/qwen3.5-0.8b-policy-v4-5k}"
 HOLDOUT="${HOLDOUT:-eval/holdout-v4.jsonl}"
 TEST_SET="${TEST_SET:-eval/policy-test-v4.jsonl}"
 TAG="${TAG:-$(basename "$ADAPTER_DIR")}"
+# word=模型吐判定词；letter=吐 A/B/C（/v1/decisions 形状）。
+# 两种格式的 checkpoint 不能混着扫——解析口径不同，混了只会得到一堆「无法解析」
+FORMAT="${FORMAT:-word}"
 LOG_DIR="${LOG_DIR:-models}"
 
 if [[ ! -d "$ADAPTER_DIR" ]]; then
@@ -38,6 +41,7 @@ summary="$LOG_DIR/eval-$TAG-summary.log"
   echo "adapters: $ADAPTER_DIR"
   echo "holdout:  $HOLDOUT"
   echo "test set: $TEST_SET"
+  echo "format:   $FORMAT"
 } >> "$summary"
 
 shopt -s nullglob
@@ -51,7 +55,7 @@ fi
 for ckpt in "${checkpoints[@]}"; do
   step=$(basename "$ckpt" | sed -E 's/^0*([0-9]+)_adapters\.safetensors$/\1/')
   log="$LOG_DIR/eval-$TAG-holdout-$step.log"
-  "$PYTHON" evaluate.py --model "$MODEL" --adapter-path "$ckpt" --data "$HOLDOUT" > "$log" 2>&1
+  "$PYTHON" evaluate.py --model "$MODEL" --adapter-path "$ckpt" --data "$HOLDOUT" --format "$FORMAT" > "$log" 2>&1
   {
     echo "== holdout $step =="
     grep -E '^(correct|漏放|误拦|无法解析)' "$log"
@@ -62,7 +66,7 @@ done
 final="${checkpoints[${#checkpoints[@]}-1]}"  # macOS bash 3.2 has no negative subscripts
 step=$(basename "$final" | sed -E 's/^0*([0-9]+)_adapters\.safetensors$/\1/')
 log="$LOG_DIR/eval-$TAG-test-$step.log"
-"$PYTHON" evaluate.py --model "$MODEL" --adapter-path "$final" --data "$TEST_SET" > "$log" 2>&1
+"$PYTHON" evaluate.py --model "$MODEL" --adapter-path "$final" --data "$TEST_SET" --format "$FORMAT" > "$log" 2>&1
 {
   echo "== $(basename "$TEST_SET" .jsonl) $step =="
   grep -E '^(correct|漏放|误拦|无法解析)' "$log"

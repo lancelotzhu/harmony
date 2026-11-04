@@ -50,6 +50,26 @@ def parse_verdict(content: str) -> str | None:
 COMMAND_BLOCK = re.compile(r"<command>\n(.*)\n</command>", re.S)
 
 
+def parse_letter(content: str | None) -> str | None:
+    """字母格式的回答取第一个独立的 A/B/C，映射回判定词。
+
+    `parse_verdict` 在这里用不了：字母模型吐的是 `Answer: C`，里面没有
+    "DANGEROUS" 这个词。反过来也要小心——不能直接找任意 A/B/C 字符，
+    `Answer` 这个词里就有 A，所以先把已知前缀剥掉再按词边界匹配。
+    """
+    from policy_prompt import CHOICES
+
+    if not content:
+        return None
+    body = content.strip()
+    if body.upper().startswith("ANSWER:"):
+        body = body[len("ANSWER:"):].strip()
+    match = re.search(r"\b([ABC])\b", body.upper())
+    if not match:
+        return None
+    return CHOICES[ord(match.group(1)) - ord("A")]
+
+
 def read_rows(path: Path) -> list[dict]:
     """评估集带 `expected` / `cmd`；训练格式的文件（train/valid.jsonl）没有。
 
@@ -81,6 +101,13 @@ def main() -> int:
     # `</think>` + `\n\n` before the verdict and `DANGEROUS` costs 4 more
     # tokens: a budget of 6 leaves exactly zero margin, and one stray
     # whitespace token truncates it to `DANGER` and fails to parse.
+    parser.add_argument(
+        "--format",
+        choices=("word", "letter"),
+        default="word",
+        help="word=模型吐 SAFE/RISKY/DANGEROUS（现行）；"
+             "letter=吐 A/B/C，按 /v1/decisions 的形状构造 prompt",
+    )
     parser.add_argument("--max-tokens", type=int, default=10)
     parser.add_argument(
         "--no-thinking",
@@ -103,12 +130,28 @@ def main() -> int:
         failures = []
         for row in rows:
             expected = row["expected"]
-            prompt = tokenizer.apply_chat_template(
-                row["messages"][:-1],
-                tokenize=False,
-                add_generation_prompt=True,
-                **template_kwargs,
-            )
+            if args.format == "letter":
+                # 字母格式：prompt 以半截的 `Answer:` 结尾，模型接着写字母。
+                # 必须用 continue_final_message，不能用 add_generation_prompt——
+                # 后者会另起一轮，`Answer:` 前缀就没了，和训练时对不上。
+                from prepare_authoritative import make_letter_sample
+
+                messages = make_letter_sample(row["cmd"], "SAFE")["messages"]
+                messages[-1]["content"] = "Answer:"
+                prompt = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=False,
+                    continue_final_message=True,
+                    **template_kwargs,
+                )
+            else:
+                prompt = tokenizer.apply_chat_template(
+                    row["messages"][:-1],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    **template_kwargs,
+                )
             answer = generate(
                 model,
                 tokenizer,
@@ -116,7 +159,7 @@ def main() -> int:
                 max_tokens=args.max_tokens,
                 verbose=False,
             )
-            got = parse_verdict(answer)
+            got = parse_letter(answer) if args.format == "letter" else parse_verdict(answer)
             total += 1
             if got == expected:
                 correct += 1
