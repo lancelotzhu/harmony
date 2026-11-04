@@ -703,7 +703,17 @@ def main() -> int:
     # 验证集同样要在训练之前占住。阈值是在它上面定的，而上游 train 和
     # validation split 也共享命令——先建训练集会让验证集里混进 85 条模型背过的
     # 行（实测），P(SAFE) 分布被背诵拉锐，定出来的阈值系统性偏高。
-    held = seen | {c for c, _ in test}
+    # 冻结的评估集在这里就要占住，而不是只在 augment 那一步剔除。
+    # 只剔 augment 挡不住从上游采样进来的同名命令——实测
+    # `git log --oneline -10` 就是这样漏进训练集的。
+    frozen_eval: set[str] = set()
+    for extra in [args.holdout, *(args.eval_sets or [])]:
+        if extra and extra.is_file():
+            for row in read_jsonl(extra):
+                if row.get("cmd"):
+                    frozen_eval.add(row["cmd"].strip())
+
+    held = seen | {c for c, _ in test} | frozen_eval
     valid_pool = collect(dataset / "validation.jsonl", held, "safe") | collect(
         dataset / "validation.jsonl", held, "danger"
     )
@@ -766,11 +776,7 @@ def main() -> int:
     #      挡不住这些手写的 augment 字面量。实测它们和测试集撞了 5 条
     #      （`gcloud auth print-access-token` 之类常见命令），不剔就是污染。
     excluded = {c for c, _ in test} | set(valid_safe) | set(valid_danger)
-    for extra in [args.holdout, *(args.eval_sets or [])]:
-        if extra and extra.is_file():
-            for row in read_jsonl(extra):
-                if row.get("cmd"):
-                    excluded.add(row["cmd"].strip())
+    excluded |= frozen_eval
     if excluded:
         before = len(augment)
         augment = [(c, l, r) for c, l, r in augment if c.strip() not in excluded]
@@ -821,7 +827,10 @@ def main() -> int:
     )
 
     train_extra = train_safe + train_danger + augment + chains
-    train = [make_sample(prompt, c, l) for c, l in base_train] + [
+    # `base_train`（本地 opencode 导出的真实命令）也要过 `excluded`。
+    # 之前只过滤了 augment 和 base_valid，于是 `git log --oneline -10` 从本地
+    # 导出里漏进训练集，和红队集撞上——评估集隔离必须覆盖**每一个**训练来源。
+    train = [make_sample(prompt, c, l) for c, l in base_train if c.strip() not in excluded] + [
         make_sample(prompt, c, l) for c, l, _ in train_extra
     ]
     stable_rng(args.seed, "train-order").shuffle(train)
