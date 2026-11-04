@@ -76,6 +76,41 @@ def make_sample(prompt: str, command: str, label: str) -> dict:
     }
 
 
+def make_letter_sample(command: str, label: str) -> dict:
+    """渲染成 oMLX `/v1/decisions` 的字母格式。
+
+    推理时 oMLX 构造的是（`api/decisions.py` 的 `render_question` +
+    `build_messages`）：
+
+        user:      {规则}\\n\\n<command>…</command>\\n\\nQuestion: {说明}
+                   \\nOptions:\\nA. SAFE\\nB. RISKY\\nC. DANGEROUS
+                   \\n\\nReply with the letter of the best option only.
+        assistant: Answer:          ← 半截轮，模型接着往下写
+
+    所以训练目标写成 `"Answer: A"` 而**不是** `" A"`：
+    `chat_template.jinja` 对 content 做 `|trim`，`" A"` 会被 trim 成 `"A"`，
+    渲染出来 `Answer:` 前缀整个消失，和推理时的串对不上，训练就白做。
+
+    另一个坑是那个空格必须有：`"Answer:A"` 会被切成 `['Answer', ':A']`，
+    `:A` 是一个合并 token，训练和打分位置立刻错位。调用方应当断言目标形如
+    `^Answer: [ABC]$`。
+    """
+    from policy_prompt import CHOICES, QUESTION_INSTRUCTIONS, render_decision_input
+
+    letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    options = "\n".join(f"{letters[i]}. {name}" for i, name in enumerate(CHOICES))
+    question = (
+        f"Question: {QUESTION_INSTRUCTIONS}\nOptions:\n{options}"
+        "\n\nReply with the letter of the best option only."
+    )
+    return {
+        "messages": [
+            {"role": "user", "content": render_decision_input(command) + "\n\n" + question},
+            {"role": "assistant", "content": f"Answer: {letters[CHOICES.index(label)]}"},
+        ]
+    }
+
+
 def find_dataset(explicit: Path | None) -> Path:
     if explicit:
         return explicit
