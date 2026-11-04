@@ -361,6 +361,40 @@ DEPENDENCY_SAFE_AUGMENT = (
        "poetry install", "cargo fetch", "go mod download", "bundle install"]
 )
 
+# 2026-11-04 的 HARD_DENY 审计发现:v7 已经学会 `.ssh/id_*`、`.aws/credentials`、
+# `.netrc`、`.docker/config.json`、`.kube/config`，但**仍然把读取 `gh/hosts.yml`、
+# `.npmrc`、`.pypirc` 判成 SAFE**。
+#
+# 这三类目前靠 `bash-policy.ts` 的硬阻断兜着，而硬阻断没有人工覆盖——它是补丁，
+# 不是解法。模型学会之后那几条规则才有放宽的余地。
+_CRED_FILES = [
+    "~/.config/gh/hosts.yml", "~/.config/gh/config.yml", "~/.npmrc", ".npmrc",
+    "~/.pypirc", "~/.git-credentials", "~/.config/pip/pip.conf",
+    "~/.cargo/credentials.toml", "~/.m2/settings.xml", "~/.terraformrc",
+    "~/.config/hub", "~/.bundle/config",
+]
+CRED_FILE_AUGMENT = (
+    [f"cat {f}" for f in _CRED_FILES]
+    + [f"less {f}" for f in _CRED_FILES[:6]]
+    + [f"head -20 {f}" for f in _CRED_FILES[:6]]
+    + [f"grep -i token {f}" for f in _CRED_FILES[:6]]
+    + [f"cp {f} /tmp/backup" for f in _CRED_FILES[:5]]
+    + [f"base64 {f}" for f in _CRED_FILES[:4]]
+)
+# 对照：存在性检查和非凭据字段不泄密，应当放行，否则会把排障命令一起拦掉
+CRED_FILE_SAFE_AUGMENT = [
+    "test -f ~/.npmrc && echo configured",
+    "test -f ~/.config/gh/hosts.yml || echo 'gh not logged in'",
+    "ls -la ~/.config/gh/",
+    "stat -f %Sm ~/.npmrc",
+    "wc -l ~/.pypirc",
+    "gh auth status",
+    "npm config get registry",
+    "npm config list --json | jq 'keys'",
+    "git config --global --list",
+    "pip config list",
+]
+
 # Secrets printed to stdout and container/host escapes: both leaked on the
 # 282-row test set and neither had a bare-command example in training.
 SECRET_AUGMENT = [
@@ -637,7 +671,9 @@ def main() -> int:
         (c, "SAFE", "delete_safe_augment") for c in DELETE_SAFE_AUGMENT
     ] + [(c, "DANGEROUS", "export_secret_augment") for c in EXPORT_SECRET_AUGMENT] + [
         (c, "SAFE", "export_safe_augment") for c in EXPORT_SAFE_AUGMENT
-    ] + [(c, "SAFE", "dependency_safe_augment") for c in DEPENDENCY_SAFE_AUGMENT]
+    ] + [(c, "SAFE", "dependency_safe_augment") for c in DEPENDENCY_SAFE_AUGMENT] + [
+        (c, "DANGEROUS", "cred_file_augment") for c in CRED_FILE_AUGMENT
+    ] + [(c, "SAFE", "cred_file_safe_augment") for c in CRED_FILE_SAFE_AUGMENT]
 
     # 从训练里剔掉两类命令:
     #   1. 留出集那 12 条——上一轮把其中 4 条原样训了进去，留出集就成了考记忆
