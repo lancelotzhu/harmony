@@ -22,6 +22,7 @@ Outputs:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import random
 import re
@@ -521,15 +522,51 @@ def collect(path: Path, seen: set[str], kind: str) -> dict[str, dict]:
     return pool
 
 
-def stratified(pool: dict[str, dict], caps: dict[str, int], rng: random.Random) -> list[tuple[str, str, str]]:
+def stable_order(commands: list[str], seed: int, *parts: str) -> list[str]:
+    """按哈希排序取样，而不是 shuffle。
+
+    `stable_rng` 只解决了「调用顺序」这一半。真正的变动源是**候选池本身**：
+    验证集多占 100 条，`collect()` 返回的池子就少了那 100 条，再 shuffle 一个
+    长度不同的列表，整个排列全变——实测只改验证集大小，训练集对称差 2427 条、
+    其中 95 条 history_rewrite 形态被换掉。
+
+    按 `hash(seed|tag|command)` 排序则是**逐条独立**的：增删某几条只影响它们
+    自己，其余元素的相对次序原封不动。于是「这一版和上一版的差异」就只剩下
+    我真正改的那部分，实验才可归因。
+    """
+    return sorted(
+        commands,
+        key=lambda c: hashlib.sha256("|".join((str(seed), *parts, c)).encode()).digest(),
+    )
+
+
+def stable_rng(seed: int, *parts: str) -> random.Random:
+    """按名字派生独立随机源，让抽样不受调用顺序影响。
+
+    原来所有抽样共用一个 `rng`，按调用顺序消耗随机数。于是**改动任何无关的
+    东西都会重排全部类别的抽样**：v10 只是多了一次验证集取样调用，上游抽到的
+    训练命令就和 v7 差了约 2000 条，其中 75 条是 `history_rewrite` 形态——
+    而那正是 v9 退步最严重的类别。
+
+    也就是说 v7 / v9 / v10 之间的对比一直被随机重排污染着，「这轮改动有没有
+    用」根本无从判断。实验要可归因，**唯一该变的是我改的那部分**。
+
+    按 `(seed, 名字)` 派生之后，每个类别的抽样只取决于它自己的名字和种子，
+    增删别处的样本不会动到它。
+    """
+    digest = hashlib.sha256(("|".join((str(seed), *parts))).encode()).digest()
+    return random.Random(int.from_bytes(digest[:8], "big"))
+
+
+def stratified(pool: dict[str, dict], caps: dict[str, int], seed: int, tag: str) -> list[tuple[str, str, str]]:
     by_reason: dict[str, list[str]] = defaultdict(list)
     for command, meta in pool.items():
         by_reason[meta["reason"]].append(command)
 
     picked: list[tuple[str, str, str]] = []
     for reason, commands in sorted(by_reason.items()):
-        commands.sort()
-        rng.shuffle(commands)
+        # 按哈希定序：别的类别增删多少、池子少了几条，都不会动到这一类的取舍
+        commands = stable_order(commands, seed, tag, reason)
         limit = caps.get(reason, len(commands))
         for command in commands[:limit]:
             picked.append((command, pool[command]["label"], reason))
@@ -597,8 +634,12 @@ def main() -> int:
     # 每次往 DANGEROUS 加形态，都要回头看一眼这个数。
     parser.add_argument("--safe-target", type=int, default=4400,
                         help="Down-sample the final SAFE side to this many rows")
+    parser.add_argument("--rebuild-test", action="store_true",
+                        help="重新抽样测试集。默认沿用已有文件——换基准会让历史成绩全部不可比")
     parser.add_argument("--chain-safe", type=int, default=250)
     parser.add_argument("--chain-danger", type=int, default=400)
+    parser.add_argument("--chain-pool", type=int, default=400,
+                        help="链式素材从全量上游池按哈希取这么多条，与训练采样解耦")
     parser.add_argument("--chain-bare-danger", type=int, default=500,
                         help="Chains whose dangerous segment is a short bare command "
                              "and never the first segment")
@@ -607,6 +648,10 @@ def main() -> int:
     parser.add_argument("--holdout", type=Path, default=Path("eval/holdout-v4.jsonl"),
                         help="Exclude these commands from training so the set stays "
                              "a generalisation test; pass a missing path to disable")
+    parser.add_argument("--eval-sets", type=Path, nargs="*",
+                        default=[Path("eval/redteam-eval.jsonl")],
+                        help="这些评估集里的命令也要从训练里剔掉。红队集和留出集一样是"
+                             "冻结基准，训练碰到它就等于考记忆")
     parser.add_argument("--max-tokens", type=int, default=880,
                         help="丢弃超过这么多 token 的训练/验证样本；0 关闭。"
                              "实测 batch 2 在 950 token 上必 OOM、900 通过，880 是留了余量的值")
@@ -623,9 +668,11 @@ def main() -> int:
     dataset = find_dataset(args.dataset_path)
     rng = random.Random(args.seed)
 
-    def take(pool: dict[str, dict], label: str, count: int) -> list[str]:
-        commands = sorted(c for c, m in pool.items() if m["label"] == label)
-        rng.shuffle(commands)
+    def take(pool: dict[str, dict], label: str, count: int, tag: str) -> list[str]:
+        """同样按名字派生随机源——否则取样顺序一变，后面全部重排。"""
+        commands = stable_order(
+            [c for c, m in pool.items() if m["label"] == label], args.seed, tag, label
+        )
         return commands[:count]
 
     # ── 先切测试集，再拿剩下的去训练 ──────────────────────────────────
@@ -636,10 +683,22 @@ def main() -> int:
     #
     # 反过来先把测试集占住，训练侧只少约 57 条（3738 条里的 1.5%，且这些本来
     # 就是测试集内容的副本，留着反而是污染），危险测试样本却能回到 132 条。
-    test_safe_pool = collect(dataset / "test.jsonl", seen, "safe")
-    test_danger_pool = collect(dataset / "test.jsonl", seen, "danger")
-    test = [(c, "SAFE") for c in take(test_safe_pool, "SAFE", args.test_safe)]
-    test += [(c, "DANGEROUS") for c in take(test_danger_pool, "DANGEROUS", args.test_dangerous)]
+    # 测试集一旦建立就**冻结**，默认读现成的而不是重新抽样。
+    #
+    # 基准换了，历史成绩就全部失去可比性。实际踩到过：把 `take()` 从 shuffle 改成
+    # 哈希定序之后测试集跟着变了，而 v7 / v9 的所有数字都是在旧测试集上测的，
+    # 一瞬间无法对照。基准是尺子，改尺子要有明确理由、并重测所有在册模型。
+    #
+    # 要重建传 `--rebuild-test`。
+    if args.test_output.is_file() and not args.rebuild_test:
+        frozen = read_jsonl(args.test_output)
+        test = [(row["cmd"], row["expected"]) for row in frozen]
+        print(f"沿用已冻结的测试集 {args.test_output}（{len(test)} 条）")
+    else:
+        test_safe_pool = collect(dataset / "test.jsonl", seen, "safe")
+        test_danger_pool = collect(dataset / "test.jsonl", seen, "danger")
+        test = [(c, "SAFE") for c in take(test_safe_pool, "SAFE", args.test_safe, "test")]
+        test += [(c, "DANGEROUS") for c in take(test_danger_pool, "DANGEROUS", args.test_dangerous, "test")]
 
     # 验证集同样要在训练之前占住。阈值是在它上面定的，而上游 train 和
     # validation split 也共享命令——先建训练集会让验证集里混进 85 条模型背过的
@@ -648,13 +707,38 @@ def main() -> int:
     valid_pool = collect(dataset / "validation.jsonl", held, "safe") | collect(
         dataset / "validation.jsonl", held, "danger"
     )
-    valid_safe = take(valid_pool, "SAFE", args.valid_safe)
-    valid_danger = take(valid_pool, "DANGEROUS", args.valid_dangerous)
+
+    # 验证集优先取**不在上游 train split 里**的命令。
+    #
+    # 上游 validation 和 train 共享大量命令，验证集取到这类就等于从训练里抽走
+    # 一条。v9 那轮把验证集从 200 扩到 596，无意中抽走了 191 条训练命令，其中
+    # 75 条是 `git reset --hard` / `rebase -i` / `clean` 形态——而 v9 退步最严重
+    # 的恰恰就是 history_rewrite（红队集漏放 1 → 13）。
+    #
+    # 实测不相交的候选有 SAFE 270 / DANGEROUS 202 条，取这些扩验证集是**零成本**的。
+    # 不够时才退回重叠的那批，并打印出来，让这笔代价是显式的而不是无声的。
+    upstream_train = set(collect(dataset / "train.jsonl", held, "safe")) | set(
+        collect(dataset / "train.jsonl", held, "danger")
+    )
+
+    def take_valid(label: str, count: int) -> list[str]:
+        free = {c: m for c, m in valid_pool.items() if c not in upstream_train}
+        picked = take(free, label, count, "valid-free")
+        if len(picked) < count:
+            rest = {c: m for c, m in valid_pool.items() if c in upstream_train and c not in picked}
+            extra = take(rest, label, count - len(picked), "valid-borrow")
+            print(f"验证集 {label}: 不相交候选只有 {len(picked)} 条，"
+                  f"另从训练池借走 {len(extra)} 条")
+            picked += extra
+        return picked
+
+    valid_safe = take_valid("SAFE", args.valid_safe)
+    valid_danger = take_valid("DANGEROUS", args.valid_dangerous)
 
     reserved = held | set(valid_safe) | set(valid_danger)
 
-    train_safe = stratified(collect(dataset / "train.jsonl", reserved, "safe"), SAFE_CAPS, rng)
-    train_danger = stratified(collect(dataset / "train.jsonl", reserved, "danger"), DANGEROUS_CAPS, rng)
+    train_safe = stratified(collect(dataset / "train.jsonl", reserved, "safe"), SAFE_CAPS, args.seed, "train-safe")
+    train_danger = stratified(collect(dataset / "train.jsonl", reserved, "danger"), DANGEROUS_CAPS, args.seed, "train-danger")
 
 
     augment = [(c, "SAFE", "git_augment") for c in GIT_ROUTINE_AUGMENT] + [
@@ -682,13 +766,15 @@ def main() -> int:
     #      挡不住这些手写的 augment 字面量。实测它们和测试集撞了 5 条
     #      （`gcloud auth print-access-token` 之类常见命令），不剔就是污染。
     excluded = {c for c, _ in test} | set(valid_safe) | set(valid_danger)
-    if args.holdout and args.holdout.is_file():
-        for row in read_jsonl(args.holdout):
-            if row.get("cmd"):
-                excluded.add(row["cmd"].strip())
+    for extra in [args.holdout, *(args.eval_sets or [])]:
+        if extra and extra.is_file():
+            for row in read_jsonl(extra):
+                if row.get("cmd"):
+                    excluded.add(row["cmd"].strip())
+    if excluded:
         before = len(augment)
         augment = [(c, l, r) for c, l, r in augment if c.strip() not in excluded]
-        print(f"holdout exclusion: dropped {before - len(augment)} augment rows")
+        print(f"评估集剔除：augment 去掉 {before - len(augment)} 条")
 
     # These shapes are rare but carry the policy, so repeat them.  Without this
     # they are a handful of rows against ~150 bare `git ...` SAFE rows and the
@@ -698,12 +784,23 @@ def main() -> int:
         weighted.extend([(command, label, reason)] * args.augment_repeat)
     augment = weighted
 
+    # 链式样本的素材池要和**训练采样无关**。
+    #
+    # 原来是从 `safe_pool + train_safe` 里 `rng.choice`。训练采样只要变几条，
+    # 源列表的长度和内容就变，每个索引映射到的元素随之全变——于是 1150 条链
+    # 条条不同。实测：验证集只多占 30 条命令，训练集对称差却有 2483 条，其中
+    # 约 2300 条是被这样放大出来的链。那让任何两版数据都无法比较。
+    #
+    # 改成从**全量上游池**按哈希定序取固定前 N 条：少掉几个候选只影响那几条，
+    # 其余素材原封不动。
     safe_pool = [c for c, m in collect(dataset / "train.jsonl", seen, "safe").items()]
     danger_pool = [c for c, m in collect(dataset / "train.jsonl", seen, "danger").items()]
+    chain_safe_src = stable_order(safe_pool, args.seed, "chain-src-safe")[: args.chain_pool]
+    chain_danger_src = stable_order(danger_pool, args.seed, "chain-src-danger")[: args.chain_pool]
     chains = build_chains(
-        safe_pool + [c for c, _, _ in train_safe],
-        danger_pool + [c for c, _, _ in train_danger],
-        rng,
+        chain_safe_src,
+        chain_danger_src,
+        stable_rng(args.seed, "chains-generic"),
         args.chain_safe,
         args.chain_danger,
     )
@@ -714,9 +811,9 @@ def main() -> int:
     # the model has to read past a plausible-looking first segment.
     bare_danger = [c for c, l, _ in augment if l == "DANGEROUS" and chainable(c)]
     chains += build_chains(
-        safe_pool + [c for c, _, _ in train_safe],
+        chain_safe_src,
         sorted(set(bare_danger)),
-        rng,
+        stable_rng(args.seed, "chains-bare"),
         0,
         args.chain_bare_danger,
         styles=("middle", "last", "lines", "lines4", "semi"),
@@ -727,16 +824,25 @@ def main() -> int:
     train = [make_sample(prompt, c, l) for c, l in base_train] + [
         make_sample(prompt, c, l) for c, l, _ in train_extra
     ]
-    rng.shuffle(train)
+    stable_rng(args.seed, "train-order").shuffle(train)
 
     # Keep SAFE/DANGEROUS close to balanced: the previous 2:1 SAFE prior made
     # the model default to SAFE on chains whose first line was harmless.
     safe_rows = [row for row in train if row["messages"][-1]["content"] == "SAFE"]
     other_rows = [row for row in train if row["messages"][-1]["content"] != "SAFE"]
     if len(safe_rows) > args.safe_target:
-        safe_rows = safe_rows[: args.safe_target]
+        # 按**每行自己的哈希**定序后截断，而不是截断一个 shuffle 过的列表。
+        #
+        # 这是同一类放大器的最后一处：原来 `safe_rows[:4400]` 取的是乱序列表的
+        # 前 4400 条，SAFE 集合只要变几条，整个顺序重排，被留下的那 4400 条就
+        # 换掉一大片。实测验证集多占 30 条训练命令，却churn 掉 869 条单段命令。
+        #
+        # 逐行哈希定序之后，增删某几行只影响它们自己。
+        key = lambda row: json.dumps(row, ensure_ascii=False, sort_keys=True)  # noqa: E731
+        wanted = set(stable_order([key(r) for r in safe_rows], args.seed, "safe-cap")[: args.safe_target])
+        safe_rows = [r for r in safe_rows if key(r) in wanted]
     train = safe_rows + other_rows
-    rng.shuffle(train)
+    stable_rng(args.seed, "train-order").shuffle(train)
 
     # 留出集那 12 条是从本地导出的 valid 切片里挑的，所以它们本来就躺在
     # `base_valid` 里。阈值在验证集上定、再拿留出集报分就成了循环论证，剔掉。
