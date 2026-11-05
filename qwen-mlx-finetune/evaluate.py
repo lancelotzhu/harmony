@@ -109,6 +109,10 @@ def main() -> int:
              "letter=吐 A/B/C，按 /v1/decisions 的形状构造 prompt",
     )
     parser.add_argument("--max-tokens", type=int, default=10)
+    # 每个模型必须用**它自己训练时的**提示词打分，否则是分布外，对照失真。
+    # v7 / v9 / v11 用 full，v13 起用 short。
+    parser.add_argument("--prompt", choices=("short", "full"), default="short",
+                        help="按哪个提示词版本渲染；历史模型（v7/v9/v11）要传 full")
     parser.add_argument(
         "--no-thinking",
         action="store_true",
@@ -157,7 +161,7 @@ def main() -> int:
                 from policy_prompt import render
 
                 prompt = tokenizer.apply_chat_template(
-                    [{"role": "user", "content": render(row["cmd"])}],
+                    [{"role": "user", "content": render(row["cmd"], args.prompt)}],
                     tokenize=False,
                     add_generation_prompt=True,
                     **template_kwargs,
