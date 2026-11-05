@@ -69,8 +69,15 @@ def resolve_adapter(path, stack):
     return staging
 
 
-def score_rows(model, tok, rows, fmt):
-    """返回每行在三档上的 **logit**（未归一化），温度标定要在 logit 上做。"""
+def score_rows(model, tok, rows, fmt, variant="short"):
+    """返回每行在三档上的 **logit**（未归一化），温度标定要在 logit 上做。
+
+    提示词**现渲染**，不用文件里存的 `messages`——冻结评估集存的是生成它那一刻的
+    提示词（旧的完整版），拿它给短提示词训的模型打分就是分布外，标定出来的阈值
+    是假的。`evaluate.py` 早就改成现渲染了，这里当时漏了。
+    """
+    from policy_prompt import render
+
     letter_ids = letter_token_ids(tok) if fmt == "letter" else None
     out = []
     for r in rows:
@@ -88,7 +95,8 @@ def score_rows(model, tok, rows, fmt):
             z = np.array([np.logaddexp.reduce(lp[ids]) for ids in letter_ids])
         else:
             prompt = tok.apply_chat_template(
-                r["messages"][:-1], tokenize=False, add_generation_prompt=True
+                [{"role": "user", "content": render(r["cmd"], variant)}],
+                tokenize=False, add_generation_prompt=True,
             ) + "</think>\n\n"
             logits = model(mx.array(tok.encode(prompt))[None])[0, -1].astype(mx.float32)
             lp = np.asarray((logits - mx.logsumexp(logits)).tolist(), dtype=np.float64)
@@ -183,20 +191,32 @@ def main():
     ap.add_argument("--fit", type=Path, required=True, help="拟合温度用的数据（验证集）")
     ap.add_argument("--eval", type=Path, required=True, help="报告用的数据，必须和 --fit 不同")
     ap.add_argument("--tag", default="")
+    # 每个模型用它自己训练时的提示词打分。v7/v9/v11 传 full，v13 起用 short。
+    ap.add_argument("--prompt", choices=("short", "full"), default="short")
     args = ap.parse_args()
 
     def load_rows(path):
         rows = [json.loads(l) for l in open(path) if l.strip()]
+        import re as _re
+        block = _re.compile(r"<command>\n(.*?)\n</command>", _re.S)
         for r in rows:
-            r.setdefault("expected", r["messages"][-1]["content"].strip())
-            r.setdefault("cmd", "")
+            # 不能用 setdefault：第二个参数会被急求值，没有 messages 的文件
+            # （只带 cmd 的真实命令清单）会直接 KeyError
+            if not r.get("expected"):
+                r["expected"] = r["messages"][-1]["content"].strip()
+            if not r.get("cmd"):
+                # 训练格式的文件（valid.jsonl）没有 cmd 字段，从命令块里捞回来
+                m = block.search(r.get("messages", [{}])[0].get("content", ""))
+                if not m:
+                    raise SystemExit(f"{path} 里有行既没有 cmd 也解析不出命令块")
+                r["cmd"] = m.group(1)
         return rows
 
     fit_rows, ev_rows = load_rows(args.fit), load_rows(args.eval)
     with contextlib.ExitStack() as stack:
         model, tok = load(args.model, adapter_path=resolve_adapter(args.adapter_path, stack))
-        z_fit = score_rows(model, tok, fit_rows, args.format)
-        z_ev = score_rows(model, tok, ev_rows, args.format)
+        z_fit = score_rows(model, tok, fit_rows, args.format, args.prompt)
+        z_ev = score_rows(model, tok, ev_rows, args.format, args.prompt)
 
     y_fit = np.array([LABELS.index(r["expected"]) for r in fit_rows])
     y_ev = np.array([LABELS.index(r["expected"]) for r in ev_rows])
