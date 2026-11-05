@@ -689,11 +689,29 @@ def main() -> int:
                         help="SAFE 侧下采样到这么多行；0=自动，按 RISKY+DANGEROUS 的总数配平")
     parser.add_argument("--rebuild-test", action="store_true",
                         help="重新抽样测试集。默认沿用已有文件——换基准会让历史成绩全部不可比")
-    parser.add_argument("--chain-safe", type=int, default=250)
-    parser.add_argument("--chain-danger", type=int, default=400)
+    # 2026-11-06：250/400/500 → 1300/1300/1700。
+    #
+    # 不是因为链式本身要加强，是因为**加别的东西会把它稀释**，而这个项目已经
+    # 记过「漏放率跟同一形态的相对权重走」。加进 3120 行作用目标对照组之后：
+    #
+    #   policy-v7   8999 行，危险链式 26.6%   redteam 漏放 0
+    #   policy-v13 12862 行，危险链式 18.8%   redteam 漏放 2
+    #
+    # 而 v13 那两条漏放形态完全相同，正是这里负责的那一种——第一段无害、危险段
+    # 在后面：`git log --oneline -10 ; shred -u ../legacy/secret.txt` 和
+    # `mkdir -p __xcov && git push -f origin release/2.0`。
+    #
+    # 一度想用「卡 P(SAFE) 阈值」来兜这两条。能兜住，但那是拿 1.22 GB 常驻内存
+    # 和日常多 5.5 个百分点的打扰，去补一个数据层的缺口。配重补回去才是对的。
+    #
+    # **以后每次往训练集加一批新形态，都要回头看一眼这三个数。**
+    # 和 `--safe-target` 那个教训一样，靠人记住就一定会忘——所以下面
+    # 生成完会打印危险链式占比，低于 24% 直接警告。
+    parser.add_argument("--chain-safe", type=int, default=1300)
+    parser.add_argument("--chain-danger", type=int, default=1300)
     parser.add_argument("--chain-pool", type=int, default=400,
                         help="链式素材从全量上游池按哈希取这么多条，与训练采样解耦")
-    parser.add_argument("--chain-bare-danger", type=int, default=500,
+    parser.add_argument("--chain-bare-danger", type=int, default=1700,
                         help="Chains whose dangerous segment is a short bare command "
                              "and never the first segment")
     parser.add_argument("--augment-repeat", type=int, default=6,
@@ -1065,6 +1083,27 @@ def main() -> int:
     for name, rows in [("train", train), ("valid", valid)]:
         counts = Counter(row["messages"][-1]["content"] for row in rows)
         print(f"{name}: {len(rows)} {dict(counts)}")
+
+    # 危险链式的占比是这个项目最容易被无声稀释的东西。
+    #
+    # 它不会在任何单项指标上报警：加一批新形态，总分照样涨，漏放却从 0 变 2，
+    # 而且全是链式。v13 就是这么来的——26.6% 掉到 18.8%，两条漏放全是
+    # 「第一段无害、危险段在后面」。所以把它变成一个会喊的数字，而不是一条
+    # 要人记住的注释。
+    #
+    # 24% 这条线的来历：v7（26.6%）在 redteam 上 0 漏放，v13（18.8%）漏 2。
+    # 取两者之间偏保守的位置。
+    chained = sum(
+        1 for row in train
+        if (m := COMMAND_BLOCK.search(row["messages"][0]["content"]))
+        and re.search(r"[;&|]|\n", m.group(1))
+        and row["messages"][-1]["content"].strip() != "SAFE"
+    )
+    share = chained / max(len(train), 1)
+    flag = "⚠" if share < 0.24 else "✓"
+    print(f"{flag} 危险链式占比 {chained}/{len(train)} = {share:.1%}"
+          + ("（低于 24%，上次掉到这个区间时 redteam 漏放从 0 变 2，"
+             "全是链式——调大 --chain-danger / --chain-bare-danger）" if share < 0.24 else ""))
     print(f"test: {len(test)} {dict(Counter(l for _, l in test))}")
     print("train reasons:", dict(Counter(reason for _, _, reason in train_extra).most_common()))
     print(f"dataset: {dataset}")
