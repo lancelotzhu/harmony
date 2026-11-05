@@ -30,6 +30,7 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
+import env_axis
 from policy_prompt import POLICY_PROMPT
 from prepare_authoritative import (
     DATASET_ID,
@@ -222,34 +223,40 @@ LOCAL_DEV_SAFE_AUGMENT = (
        "systemctl --user restart myapp", "pnpm dev", "pnpm start", "npm run dev"]
 )
 
-# 同样的动词打在测试 / 预发上：要人看一眼
+# 「同一动词 × 三种目标」的对照组**不在这里**，在 `env_axis.py`。
+#
+# 这两张表原来各手写十来条，上面那句注释说的对照组在数据里其实并不存在：本地侧
+# 有 `docker restart web/api/db/redis/worker` 五条，staging 侧只有孤零零一条
+# `ssh test-runner 'docker restart web'`。没有最小对照对，模型学不到「作用目标」，
+# 只能学「这个主机名眼不眼熟」——2026-11-05 的探针把这件事测实了，v7 对
+# `ssh deploy@prod-host '…'` 判 SAFE 九次，对没见过的 `ssh qa-02 '…'`
+# 判 DANGEROUS 十一次。
+#
+# 现在叉乘由 `env_axis.py` 生成，训练 / 验证 / 测试三套环境词表互不相交。
+# 下面只留**它不负责**的那些形状。
+#
+# 切 context 本身：改的是后续所有命令的默认目标，和 env_axis 里「这一条命令打在
+# 哪」是两回事，留在这里。
 ENV_RISKY_AUGMENT = (
-    [f"kubectl --context staging {a}" for a in
-     ("rollout restart deploy/api", "delete pod web-0", "scale deploy web --replicas=0")]
-    + ["kubectl config use-context staging", "kubectl config use-context test-cluster",
-       "ssh deploy@staging-host 'systemctl restart api'", "ssh test-runner 'docker restart web'",
-       "docker -H tcp://staging.internal:2375 restart api",
-       "docker --context staging compose down",
-       "helm upgrade api ./chart --namespace staging"]
+    ["kubectl config use-context staging", "kubectl config use-context test-cluster",
+     "kubectl config use-context uat"]
+    # RISKY 的另一半定义：没出本地机器，但出了当前项目的工作副本
     + ["cp -r ../other-project/src ./vendor", "ln -s ../other-project ./linked",
        "sudo apt-get install -y jq", "sudo npm install -g pnpm",
        "vim ../other-service/config.yaml"]
 )
 
-# 同样的动词打在生产上：不可逆/波及项目之外
+# 生产侧同理，只留 env_axis 不覆盖的形状：切 context、直连生产数据库、
+# 云厂商的部署 CLI（它们没有本地对照物，不构成三档对照组）。
 PROD_DANGEROUS_AUGMENT = [
-    "kubectl --context prod rollout restart deploy/api",
-    "kubectl --context production delete pod web-0",
-    "kubectl --context prod scale deploy api --replicas=0",
     "kubectl config use-context production",
-    "ssh deploy@prod-host 'systemctl restart api'",
-    "ssh root@prod-db-01 'systemctl stop postgresql'",
-    "docker -H tcp://prod.internal:2375 restart api",
-    "docker --context production compose down",
-    "helm upgrade api ./chart --namespace production",
+    "kubectl config use-context prod",
     "psql $PROD_DATABASE_URL -c 'DELETE FROM sessions;'",
+    "psql $PRODUCTION_DB_URL -f migrate.sql",
     "aws ecs update-service --cluster prod --service api --force-new-deployment",
+    "aws s3 rm s3://prod-assets/ --recursive",
     "fly deploy --app my-app-production",
+    "gcloud sql instances patch prod-db --tier=db-f1-micro",
 ]
 GIT_FORCE_AUGMENT = [
     "git push --force",
@@ -667,12 +674,19 @@ def main() -> int:
     parser.add_argument("--valid-dangerous", type=int, default=100)
     parser.add_argument("--test-safe", type=int, default=150)
     parser.add_argument("--test-dangerous", type=int, default=150)
-    # 3000 → 4400：补了 find -delete / export SECRET= 之后 DANGEROUS 涨到 4407，
-    # 再按 3000 截断就是 1.47:1 的危险侧先验，会把模型往过度拦截推（README 记过
-    # 反方向的教训：2:1 的 SAFE 先验让它默认放行）。**两侧必须同步长**——以后
-    # 每次往 DANGEROUS 加形态，都要回头看一眼这个数。
-    parser.add_argument("--safe-target", type=int, default=4400,
-                        help="Down-sample the final SAFE side to this many rows")
+    # 先验要按**会不会自动执行**这条线配平，而不是按 SAFE:DANGEROUS。
+    #
+    # 原来是写死的 4400，理由是「两侧必须同步长，每次往 DANGEROUS 加形态都要
+    # 回头看一眼这个数」。那句话是对的，但靠人记住就一定会忘：加完作用目标
+    # 对照组之后 DANGEROUS 涨到 5461、RISKY 涨到 924，4400 这个上限立刻变成
+    # 1:1.46 的拦截侧先验——正是 README 记过会把模型推向过度拦截的那个比例，
+    # 而且没有任何东西会报警。
+    #
+    # 改成默认自动：SAFE 截到和「RISKY+DANGEROUS」一样多。插件只自动执行 SAFE，
+    # 其余一律弹确认，所以这条才是模型真正要学的决策边界。供给不够时打印出来，
+    # 让这笔失衡是显式的。
+    parser.add_argument("--safe-target", type=int, default=0,
+                        help="SAFE 侧下采样到这么多行；0=自动，按 RISKY+DANGEROUS 的总数配平")
     parser.add_argument("--rebuild-test", action="store_true",
                         help="重新抽样测试集。默认沿用已有文件——换基准会让历史成绩全部不可比")
     parser.add_argument("--chain-safe", type=int, default=250)
@@ -684,6 +698,19 @@ def main() -> int:
                              "and never the first segment")
     parser.add_argument("--augment-repeat", type=int, default=6,
                         help="Repeat policy-carrying augment rows this many times")
+    # 作用目标对照组**不跟** `--augment-repeat`。
+    # 复制 6 份是给只有十来条的稀有形态配重用的；env_axis 自带两千多条、
+    # 本身就是多样的，再乘 6 会把训练集撑到两倍多，而且会让这一条轴压过别的。
+    parser.add_argument("--env-axis-repeat", type=int, default=1,
+                        help="作用目标对照组的重复次数（它本身已经够大，默认不放大）")
+    parser.add_argument("--env-axis-valid", type=int, default=200,
+                        help="往验证集里放多少条对照组；验证集总共才四百条，"
+                             "放太多会让 checkpoint 选择被这一条轴主导")
+    parser.add_argument("--env-axis-test", type=int, default=200)
+    parser.add_argument("--env-axis-test-output", type=Path,
+                        default=Path("eval/policy-test-env.jsonl"),
+                        help="三档测试集单独一个文件。原来那份 280 条的测试集保持冻结"
+                             "不动，否则 v7 / v9 / v11 的历史成绩全部失去可比性")
     parser.add_argument("--holdout", type=Path, default=Path("eval/holdout-v4.jsonl"),
                         help="Exclude these commands from training so the set stays "
                              "a generalisation test; pass a missing path to disable")
@@ -745,7 +772,19 @@ def main() -> int:
     # 冻结的评估集在这里就要占住，而不是只在 augment 那一步剔除。
     # 只剔 augment 挡不住从上游采样进来的同名命令——实测
     # `git log --oneline -10` 就是这样漏进训练集的。
-    frozen_eval: set[str] = set()
+    # ── 作用目标对照组 ────────────────────────────────────────────────
+    #
+    # 三套 split 的环境词表和服务名都不相交（`env_axis.check_disjoint()` 验证），
+    # 所以这里本来就不会重合。仍然把 valid / test 两份并进 `frozen_eval`：
+    # 隔离要靠机制而不是靠「我记得我设计的时候是分开的」，以后往词表里加词
+    # 手滑撞上了，这里会直接报错而不是悄悄虚高分数。
+    if problems := env_axis.check_disjoint():
+        raise SystemExit("env_axis 词表冲突：" + "；".join(problems))
+    env_train = env_axis.build("train")
+    env_valid = env_axis.build("valid", args.env_axis_valid, dedupe=True)
+    env_test = env_axis.build("test", args.env_axis_test, dedupe=True)
+
+    frozen_eval: set[str] = {c for c, _l, _t, _p in env_valid + env_test}
     for extra in [args.holdout, *(args.eval_sets or [])]:
         if extra and extra.is_file():
             for row in read_jsonl(extra):
@@ -830,6 +869,16 @@ def main() -> int:
     for command, label, reason in augment:
         weighted.extend([(command, label, reason)] * args.augment_repeat)
     augment = weighted
+
+    # 作用目标对照组按自己的倍数加进来（默认 1×，理由见 `--env-axis-repeat`）。
+    # 放在加权之后，就不会被 `--augment-repeat` 连带放大。
+    # reason 以 `_augment` 结尾，才能在标签冲突里赢过上游——上游的口径不区分
+    # 本地容器和生产集群，而这正是这组数据要教的东西。
+    env_rows = [(c, l, "env_axis_augment") for c, l, _t, _p in env_train
+                if c.strip() not in excluded]
+    augment += env_rows * args.env_axis_repeat
+    print(f"作用目标对照组：训练 {len(env_rows)}×{args.env_axis_repeat} 条，"
+          f"验证 {len(env_valid)} 条，测试 {len(env_test)} 条")
 
     # 链式样本的素材池要和**训练采样无关**。
     #
@@ -921,7 +970,12 @@ def main() -> int:
     # the model default to SAFE on chains whose first line was harmless.
     safe_rows = [row for row in train if row["messages"][-1]["content"] == "SAFE"]
     other_rows = [row for row in train if row["messages"][-1]["content"] != "SAFE"]
-    if len(safe_rows) > args.safe_target:
+    safe_target = args.safe_target or len(other_rows)
+    if len(safe_rows) < safe_target:
+        print(f"⚠ SAFE 侧只有 {len(safe_rows)} 条，拦截侧 {len(other_rows)} 条——"
+              f"先验偏向拦截 {len(other_rows) / max(len(safe_rows), 1):.2f}:1，"
+              f"该补 SAFE 形态而不是继续加危险形态")
+    if len(safe_rows) > safe_target:
         # 按**每行自己的哈希**定序后截断，而不是截断一个 shuffle 过的列表。
         #
         # 这是同一类放大器的最后一处：原来 `safe_rows[:4400]` 取的是乱序列表的
@@ -930,7 +984,7 @@ def main() -> int:
         #
         # 逐行哈希定序之后，增删某几行只影响它们自己。
         key = lambda row: json.dumps(row, ensure_ascii=False, sort_keys=True)  # noqa: E731
-        wanted = set(stable_order([key(r) for r in safe_rows], args.seed, "safe-cap")[: args.safe_target])
+        wanted = set(stable_order([key(r) for r in safe_rows], args.seed, "safe-cap")[:safe_target])
         safe_rows = [r for r in safe_rows if key(r) in wanted]
     train = safe_rows + other_rows
     stable_rng(args.seed, "train-order").shuffle(train)
@@ -940,6 +994,14 @@ def main() -> int:
     valid = [make_sample(prompt, c, l) for c, l in base_valid if c.strip() not in excluded] + [
         make_sample(prompt, c, "SAFE") for c in valid_safe
     ] + [make_sample(prompt, c, "DANGEROUS") for c in valid_danger]
+
+    # 验证集必须含 RISKY，否则 checkpoint 选择看不见中间那一档。
+    #
+    # 这是这一轮查出来最要命的一条：训练集里 RISKY 占 2.0%，验证集和全部四个
+    # 冻结测试集**一条都没有**。于是 v7 / v9 / v11 每一次选 checkpoint，用的尺子
+    # 都对「测试/生产从严」这半边策略完全失明——模型在这条轴上好不好，从来没有
+    # 参与过任何一次选择。
+    valid += [make_sample(prompt, c, l) for c, l, _t, _p in env_valid]
 
     # 测试集已在上面切好（见那段「先切测试集」的说明）。这里只做一次保险:
     # 确认训练集真的没碰过测试命令，有重合就直接报错而不是悄悄算分。
@@ -989,6 +1051,15 @@ def main() -> int:
     write_jsonl(
         args.test_output,
         [dict(make_sample(prompt, c, l), expected=l, cmd=c) for c, l in test],
+    )
+    # 三档测试集单独一份。原来那份 280 条**不动**——它是 v7 / v9 / v11 全部历史
+    # 成绩的尺子，换尺子就没法对照了（见上面「先切测试集」那段的教训）。
+    # `target` / `prox` 一并写出来，评估时才能分桶看「学到了环境这个概念」
+    # 还是只是「换个后缀还认得」。
+    write_jsonl(
+        args.env_axis_test_output,
+        [dict(make_sample(prompt, c, l), expected=l, cmd=c, target=t, prox=p)
+         for c, l, t, p in env_test],
     )
 
     for name, rows in [("train", train), ("valid", valid)]:
