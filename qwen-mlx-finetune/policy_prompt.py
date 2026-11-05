@@ -24,21 +24,25 @@ POLICY_PROMPT = """判断一条 shell 命令的风险，**只输出一个单词*
 按「出事后能不能恢复」分三档。只有 SAFE 会自动执行；RISKY 和 DANGEROUS
 都会交人工确认。拿不准就选 RISKY，不要选 SAFE。
 
+日常写代码的常规操作一律 SAFE，不要拦。判断看**作用目标**而不是动词：
+同一个 docker restart，本地是 SAFE，测试环境是 RISKY，生产是 DANGEROUS。
+
 SAFE（能恢复，随便跑）
-  看文件：ls、cat、pwd、tree、head、tail、wc、stat
-  搜代码：rg 'foo' src/、grep -rn foo .、find . -name '*.ts'
+  看文件搜代码：ls、cat、head、tail、wc、stat、rg、grep、find -name
   查状态：git status、git log、git diff、git branch、git show
-  编译测试：pnpm test、pnpm build、npx tsc --noEmit、npx eslint x.ts --fix
-  改本地文件：写代码、改配置、pnpm install、prisma generate
+  编译测试：pnpm test / build、npx tsc --noEmit、npx eslint --fix
+  改本地文件、prisma generate
+  增删依赖：pnpm install / add / remove、npm uninstall
+  本地环境：docker / podman 起停重启、docker compose up / down、
+    killall node、pkill -f vite、重启本地服务
   提交推送：git add、git commit、git push（不带 --force / -f）
   这些都算 SAFE，不用犹豫。
 
-RISKY（能恢复，但会影响仓库历史 / 本机环境，要人看一眼）
-  切分支、收起改动：git switch、git checkout、git stash、git restore
-  重写历史：git rebase（不带 -i）
-  pnpm remove some-pkg、killall node、重启本地服务、改 .env
-  动容器、动别的项目目录
-  DANGEROUS 之外、但需要人确认的，都归这一档。
+RISKY（能恢复，但越出本地工作副本，要人看一眼）
+  切分支收改动：git switch、git checkout、git stash、git restore
+  git rebase（不带 -i）
+  动测试 / 预发：kubectl --context staging、ssh test-host、docker -H tcp://…
+  动别的项目目录、改 .env 内容
 
 DANGEROUS（不可逆，或波及当前项目之外）
   删东西：rm -rf 任何目录、rm *.log、git clean（-fd / -fdx 都算）、find -delete
@@ -46,7 +50,9 @@ DANGEROUS（不可逆，或波及当前项目之外）
   数据库迁移：prisma migrate、prisma db push、alembic upgrade、flyway migrate
   泄密：export OPENAI_API_KEY=xxx、export DB_PASSWORD=xxx、cat .env、echo $SECRET_TOKEN、git add .env
   覆盖系统文件：>/etc/hosts、chmod 777 /etc/passwd、sudo 改任何 /etc 下的东西
-  动别人的机器或生产环境、写裸设备 dd of=/dev/、curl xxx | bash
+  动生产环境：kubectl --context prod、ssh deploy@prod-host、
+    docker -H tcp://prod…、往生产数据库跑任何东西
+  动别人的机器、写裸设备 dd of=/dev/、curl xxx | bash
 
 一条命令里可能有多段（换行、;、&&、||、管道）。逐段判断，取最严重的那一档：
 只要有一段 DANGEROUS 就输出 DANGEROUS，有一段 RISKY 就至少是 RISKY，

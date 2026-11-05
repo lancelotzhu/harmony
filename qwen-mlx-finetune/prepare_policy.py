@@ -194,23 +194,62 @@ GIT_RISKY_AUGMENT = [
 # `chmod` / `chown` / `mv` / `export` stay out -- the prompt lists local file
 # edits as SAFE, and teaching them as RISKY would train the model against its
 # own instructions (and against 6 SAFE rows in the test set).
-ENV_RISKY_AUGMENT = [
-    "pnpm remove lodash",
-    "npm uninstall react",
-    "yarn remove axios",
-    "killall node",
-    "pkill -f vite",
-    "docker compose down",
-    "docker compose restart",
-    "podman stop app",
-    "docker stop web",
-    "systemctl --user restart myapp",
-    "kubectl config use-context staging",
-    "kubectl scale deploy web --replicas=0",
-    "cp -r ../other-project/src ./vendor",
-    "ln -s ../other-project ./linked",
-    "sudo apt-get install -y jq",
-    "sudo npm install -g pnpm",
+# 2026-11-05 策略修正：这是 vibe coding 场景，**日常开发操作一律放行**。
+#
+# 原来把「动容器」「pnpm remove」「killall」整类归为 RISKY，方向错了：本地起停
+# 一个容器、卸一个依赖、杀掉自己起的 dev server，都是每天要做几十次的事，
+# 拦下来只是制造打扰，而且它们完全可恢复。
+#
+# 真正的判别依据是**作用目标**而不是动词：同一个 `docker restart`，
+# 打在本地容器上是 SAFE，打在 staging 上是 RISKY，打在 prod 上是 DANGEROUS。
+# 所以这里按「同一动词 × 三种目标」造对照组，让模型学到的是目标而不是关键词。
+_CONTAINERS = ["web", "api", "db", "redis", "worker", "nginx", "app", "cache"]
+_PKGS_RM = ["lodash", "react", "axios", "vitest", "zod", "express", "jest", "chalk"]
+
+LOCAL_DEV_SAFE_AUGMENT = (
+    [f"docker {verb} {c}" for verb in ("stop", "start", "restart", "rm") for c in _CONTAINERS[:5]]
+    + [f"podman {verb} {c}" for verb in ("stop", "start", "restart") for c in _CONTAINERS[:4]]
+    + ["docker compose up -d", "docker compose down", "docker compose restart",
+       "docker compose up --build", "docker compose logs -f api", "docker compose ps",
+       "podman compose down", "docker ps -a", "docker images"]
+    + [f"pnpm remove {p}" for p in _PKGS_RM]
+    + [f"npm uninstall {p}" for p in _PKGS_RM[:6]]
+    + [f"yarn remove {p}" for p in _PKGS_RM[:5]]
+    + ["pnpm remove -D vitest", "npm uninstall --save-dev jest"]
+    + ["killall node", "killall -9 node", "pkill -f vite", "pkill -f webpack",
+       "pkill -f 'npm run dev'", "pkill -f next-server", "lsof -ti:3000 | xargs kill"]
+    + ["brew services restart postgresql", "brew services start redis",
+       "systemctl --user restart myapp", "pnpm dev", "pnpm start", "npm run dev"]
+)
+
+# 同样的动词打在测试 / 预发上：要人看一眼
+ENV_RISKY_AUGMENT = (
+    [f"kubectl --context staging {a}" for a in
+     ("rollout restart deploy/api", "delete pod web-0", "scale deploy web --replicas=0")]
+    + ["kubectl config use-context staging", "kubectl config use-context test-cluster",
+       "ssh deploy@staging-host 'systemctl restart api'", "ssh test-runner 'docker restart web'",
+       "docker -H tcp://staging.internal:2375 restart api",
+       "docker --context staging compose down",
+       "helm upgrade api ./chart --namespace staging"]
+    + ["cp -r ../other-project/src ./vendor", "ln -s ../other-project ./linked",
+       "sudo apt-get install -y jq", "sudo npm install -g pnpm",
+       "vim ../other-service/config.yaml"]
+)
+
+# 同样的动词打在生产上：不可逆/波及项目之外
+PROD_DANGEROUS_AUGMENT = [
+    "kubectl --context prod rollout restart deploy/api",
+    "kubectl --context production delete pod web-0",
+    "kubectl --context prod scale deploy api --replicas=0",
+    "kubectl config use-context production",
+    "ssh deploy@prod-host 'systemctl restart api'",
+    "ssh root@prod-db-01 'systemctl stop postgresql'",
+    "docker -H tcp://prod.internal:2375 restart api",
+    "docker --context production compose down",
+    "helm upgrade api ./chart --namespace production",
+    "psql $PROD_DATABASE_URL -c 'DELETE FROM sessions;'",
+    "aws ecs update-service --cluster prod --service api --force-new-deployment",
+    "fly deploy --app my-app-production",
 ]
 GIT_FORCE_AUGMENT = [
     "git push --force",
@@ -766,6 +805,8 @@ def main() -> int:
     ] + [(c, "DANGEROUS", "export_secret_augment") for c in EXPORT_SECRET_AUGMENT] + [
         (c, "SAFE", "export_safe_augment") for c in EXPORT_SAFE_AUGMENT
     ] + [(c, "SAFE", "dependency_safe_augment") for c in DEPENDENCY_SAFE_AUGMENT] + [
+        (c, "SAFE", "local_dev_safe_augment") for c in LOCAL_DEV_SAFE_AUGMENT
+    ] + [(c, "DANGEROUS", "prod_dangerous_augment") for c in PROD_DANGEROUS_AUGMENT] + [
         (c, "DANGEROUS", "cred_file_augment") for c in CRED_FILE_AUGMENT
     ] + [(c, "SAFE", "cred_file_safe_augment") for c in CRED_FILE_SAFE_AUGMENT]
 
@@ -826,13 +867,54 @@ def main() -> int:
         reason="chain_bare_danger",
     )
 
-    train_extra = train_safe + train_danger + augment + chains
+    # `base_train`（本地 opencode 导出）也要一起参与冲突消解，它和上游一样
+    # 可能和本项目的策略打架：`killall node` 的 DANGEROUS 就是从这里来的。
+    base_rows = [(c, l, "base") for c, l in base_train if c.strip() not in excluded]
+    train_extra = base_rows + train_safe + train_danger + augment + chains
+
+    # 同一条命令被打上不同标签，两条样本会互相抵消——模型学到的是噪声。
+    #
+    # 实测抓到过两条：`killall node` 同时是 DANGEROUS（上游 `kill_broad`）和
+    # SAFE（本项目新策略：本地杀 dev server 是日常操作）；`git stash` 同时是
+    # DANGEROUS 和 RISKY。
+    #
+    # 消解规则：**本项目显式写的 augment 赢过上游标签**。上游的口径不是为这个
+    # 场景定的——它不知道「本地容器」和「生产集群」的区别，而那正是本策略的
+    # 核心判别依据。augment 之间若还冲突，说明是我写错了，直接报错而不是悄悄选一个。
+    # 注意只裁掉「标签不对」的行，**不能按命令去重**——augment 的重复次数就是
+    # 它的权重（`--augment-repeat`），去重会把刻意加的配重一起抹掉。
+    labels_seen: dict[str, set[tuple[str, bool]]] = defaultdict(set)
+    for command, label, reason in train_extra:
+        labels_seen[command].add((label, reason.endswith("_augment")))
+
+    winner: dict[str, str] = {}
+    for command, variants in labels_seen.items():
+        if len({label for label, _ in variants}) == 1:
+            continue
+        mine = {label for label, is_aug in variants if is_aug}
+        if len(mine) > 1:
+            raise SystemExit(
+                f"两条 augment 对同一命令给了不同标签，这是写错了：{command!r} -> {sorted(mine)}"
+            )
+        if mine:
+            winner[command] = next(iter(mine))
+        else:
+            # 上游自己打架：取最严的一档，宁可多问一次
+            order = {"SAFE": 0, "RISKY": 1, "DANGEROUS": 2}
+            winner[command] = max((label for label, _ in variants), key=order.__getitem__)
+
+    if winner:
+        before = len(train_extra)
+        train_extra = [
+            (c, l, r) for c, l, r in train_extra if c not in winner or l == winner[c]
+        ]
+        print(f"标签冲突消解：{len(winner)} 条命令，裁掉 {before - len(train_extra)} 行"
+              f"（augment 优先；上游互斥时取最严），例 {list(winner)[:3]}")
     # `base_train`（本地 opencode 导出的真实命令）也要过 `excluded`。
     # 之前只过滤了 augment 和 base_valid，于是 `git log --oneline -10` 从本地
     # 导出里漏进训练集，和红队集撞上——评估集隔离必须覆盖**每一个**训练来源。
-    train = [make_sample(prompt, c, l) for c, l in base_train if c.strip() not in excluded] + [
-        make_sample(prompt, c, l) for c, l, _ in train_extra
-    ]
+    # base_train 已经并进 train_extra 一起做过冲突消解，这里不再单独拼
+    train = [make_sample(prompt, c, l) for c, l, _ in train_extra]
     stable_rng(args.seed, "train-order").shuffle(train)
 
     # Keep SAFE/DANGEROUS close to balanced: the previous 2:1 SAFE prior made

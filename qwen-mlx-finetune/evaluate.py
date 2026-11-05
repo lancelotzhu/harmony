@@ -146,8 +146,18 @@ def main() -> int:
                     **template_kwargs,
                 )
             else:
+                # 从 `cmd` **现渲染**，不用评估集里存的 `messages`。
+                #
+                # 评估集文件里的 messages 带的是生成它那一刻的提示词。提示词一改，
+                # 拿旧 messages 去测新模型就是格式错配——这个项目栽过一次：插件里
+                # 还是 v1 提示词、模型按 v5 训，于是模型面对的是另一个任务。
+                #
+                # 冻结基准冻的应该是**命令和标签**，不是提示词版本。现渲染之后，
+                # 同一份基准可以用来测任何提示词版本的模型。
+                from policy_prompt import render
+
                 prompt = tokenizer.apply_chat_template(
-                    row["messages"][:-1],
+                    [{"role": "user", "content": render(row["cmd"])}],
                     tokenize=False,
                     add_generation_prompt=True,
                     **template_kwargs,
