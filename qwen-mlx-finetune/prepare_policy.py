@@ -970,7 +970,12 @@ def main() -> int:
     # 0.24 的来历：v13 的 env 份额是 23.7%，它在所有已训版本里验证集漏放最少
     # （3）、AUC 最高（0.9825）。
     #
-    # path 的 0.18 是 v15 实测调上来的。第一版定 0.06（落地 4.7%），当时写的是
+    # path 的 0.10：v15 用 0.06（落地 4.7%）时 path 轴只有 52.3%，v16 提到 0.18
+    # （落地 14.3%）**整体反而退步**（AUC 0.9872 → 0.9694）。原因不是份额不够，
+    # 是当时这份数据只有 147 条唯一命令，提份额只是把同样的字符串从重复 7 遍变成
+    # 27 遍。扩写到 1757 条唯一命令之后，10% 就能让重复率落在 3× 以内。
+    #
+    # **份额是代理指标，真正起作用的是唯一覆盖 × 权重。** 下面这段是旧注释：第一版定 0.06（落地 4.7%），当时写的是
     # 「没有历史数据支撑，先这么定」。v15 跑完有数据了，而且份额和能力大致单调：
     #
     #     env 轴   份额 23.4%  →  argmax 77.1%  AUC 0.9784  ECE 0.169
@@ -980,7 +985,7 @@ def main() -> int:
     # env 轴同量级；再高就会把 env 和链式挤下去（份额零和，见 `to_share`）。
     parser.add_argument("--env-axis-share", type=float, default=0.24,
                         help="作用目标对照组占训练集的目标比例")
-    parser.add_argument("--path-axis-share", type=float, default=0.18,
+    parser.add_argument("--path-axis-share", type=float, default=0.10,
                         help="作用路径对照组占训练集的目标比例")
     parser.add_argument("--env-axis-valid", type=int, default=200,
                         help="往验证集里放多少条对照组；验证集总共才四百条，"
