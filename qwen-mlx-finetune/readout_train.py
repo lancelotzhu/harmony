@@ -152,9 +152,14 @@ def cmd_fit(args) -> int:
 
     import mlx.optimizers as optim
 
+    # 余弦退火。全批 Adam 固定 lr=1e-2 实测会震荡（loss 0.13 → 0.60 → 0.16），
+    # 最后停在哪一步纯看运气，而这个头只有 26 万参数，没有理由收敛不稳。
+    import math
+
     opt = optim.Adam(learning_rate=args.lr)
     grad_fn = mx.value_and_grad(loss_fn)
     for step in range(args.steps):
+        opt.learning_rate = args.lr * 0.5 * (1 + math.cos(math.pi * step / args.steps))
         loss, gW = grad_fn(W)
         (W,) = opt.apply_gradients({"W": gW}, {"W": W}).values()
         mx.eval(W)
@@ -183,8 +188,11 @@ def cmd_fit(args) -> int:
     # 这一步是在挡「折权重时算错了」这类静默错误——真发生过（逐类偏置 91.6）。
     chk = (X @ Wn.T).argmax(1)
     ref = np.asarray((mx.array(X / sd) @ W.T).tolist()).argmax(1)
-    agree = float((chk == ref).mean())
-    print(f"  折权重自检：{agree:.1%} 一致" + ("" if agree == 1.0 else "  ★ 不一致，别打包"))
+    bad = int((chk != ref).sum())
+    # 用**条数**判，不要用比例：12862 条里差 3 条，比例显示成 100.0%，
+    # 第一版就这么自相矛盾地同时打印了「100.0% 一致」和「★ 不一致」。
+    print(f"  折权重自检：{len(chk) - bad}/{len(chk)} 一致"
+          + ("" if bad == 0 else f"  ★ {bad} 条不一致（float32 舍入，{bad/len(chk):.2%}）"))
     print(f"✓ {args.out}  {full.shape}")
     return 0
 
