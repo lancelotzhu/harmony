@@ -113,14 +113,20 @@ def main() -> int:
     # v7 / v9 / v11 用 full，v13 起用 short。
     parser.add_argument("--prompt", choices=("short", "full"), default="short",
                         help="按哪个提示词版本渲染；历史模型（v7/v9/v11）要传 full")
-    parser.add_argument(
-        "--no-thinking",
-        action="store_true",
-        help="Pass enable_thinking=False to the chat template (Qwen instruct models)",
-    )
+    # 2026-11-06 默认改成**关**，和插件对齐。
+    #
+    # 实测 v13 的 `reasoning_tokens` 恒为 0——它学会的是立刻吐 `</think>` 再给判定，
+    # 思考块是空的，开着只是每次多 2 个 token。580 条逐条对比（policy-test 280 +
+    # redteam 300）判定差 2 条，一条是 RISKY↔DANGEROUS（两边都拦），另一条关掉
+    # 反而判对；延迟少 34~36%。
+    #
+    # 评估和线上必须同一个口径，否则评估分数对应的是一个没人在跑的配置。
+    # 旧模型（v7 及更早，长提示词那一代）要传 `--thinking` 还原它们训练时的形状。
+    parser.add_argument("--thinking", action="store_true",
+                        help="开启思考模板。v7 及更早是带它训的，复测历史模型要传")
     args = parser.parse_args()
 
-    template_kwargs = {"enable_thinking": False} if args.no_thinking else {}
+    template_kwargs = {} if args.thinking else {"enable_thinking": False}
 
     from mlx_lm import generate, load
 
