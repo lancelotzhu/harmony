@@ -128,7 +128,8 @@ def _causal(h):
     return create_attention_mask(h, None)
 
 
-def write_package(dst: Path, backbone: Path, weight: np.ndarray, base_model: str) -> None:
+def write_package(dst: Path, backbone: Path, weight: np.ndarray, base_model: str,
+                  attention_mode: str = "noncausal_full_attention") -> None:
     """按 d3-code-readout-v1 打包，oMLX 扫到就能服务。
 
     骨干用**硬链接**，不复制——1.6 GB 复制一份纯属浪费，而且每试一个 readout
@@ -155,6 +156,11 @@ def write_package(dst: Path, backbone: Path, weight: np.ndarray, base_model: str
         Path.home().joinpath(".omlx/models/vllm-sr/d3-lite/decision_config.json").read_text()
     )
     ref["base_model"] = base_model
+    # `ATTENTION_MODES = ("causal", "noncausal_full_attention")` —— **causal 是合法的**。
+    # 这条我一开始照抄 d3-lite 的配置，把双向当成了 readout 的必要条件。
+    # 实测反过来：在未适配双向的骨干上，因果比非因果好（AUC 0.9637 vs 0.9369），
+    # 而双向要配 LLM2Vec 的 MNTP 适配才有用，那是另一个量级的工程。
+    ref["attention_mode"] = attention_mode
     (dst / "decision_config.json").write_text(json.dumps(ref, ensure_ascii=False, indent=2))
 
     mx.save_safetensors(str(dst / "readout.safetensors"),

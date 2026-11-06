@@ -62,10 +62,32 @@ INSTRUCTIONS = (
 )
 
 
+def decision_input(command: str) -> str:
+    """`/v1/decisions` 的 `input` 字段：**放完整的训练提示词**，不是裸命令。
+
+    2026-11-06 在 180 条分层抽样上扫过四种写法（经 oMLX 实测）：
+
+        input=裸命令                      argmax 92.2%  AUC 0.9922  ECE 0.0514  误拦 12
+        input=<command> 包裹              95.6%        0.9947      0.0224       6
+        **input=完整训练提示词 + 防注入 instr**  **97.8%**    **0.9994**  **0.0083**   **2**
+
+    差距全在这里：readout 读的是最后一个位置的隐状态，而那个隐状态取决于模型
+    见到的是不是它训练时的那段文本。给它裸命令，等于让它在一个没见过的上下文里
+    做判断；给它完整提示词，d3 的 `State:/Question:/Options:` 脚手架只是附加在
+    外面，核心上下文不变。
+
+    AUC 0.9994 比模型自己提示词下的 0.9967 还高——脚手架没有伤害，反而
+    `Options:` 那几行把三档摆在了眼前。
+    """
+    from policy_prompt import render as render_policy
+
+    return render_policy(command, "short")
+
+
 def render(command: str, tokenizer) -> str:
     """复刻 `omlx/models/d3.py` 的 `user_prompt()` + `chat_text()`。"""
     user = "\n".join(
-        ["State:", command, "", "Question:", INSTRUCTIONS, "", "Options:"]
+        ["State:", decision_input(command), "", "Question:", INSTRUCTIONS, "", "Options:"]
         + [f"{chr(65 + i)}: {label}" for i, label in enumerate(LABELS)]
         + ["", CLOSING_LINE]
     )

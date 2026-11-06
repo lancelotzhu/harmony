@@ -24,13 +24,15 @@ from pathlib import Path
 
 import numpy as np
 
-from readout_train import INSTRUCTIONS, LABELS, read_rows
+from readout_train import INSTRUCTIONS, LABELS, decision_input, read_rows
 
 
 def ask(endpoint: str, key: str, model: str, command: str, timeout: int) -> list[float]:
     body = json.dumps({
         "model": model,
-        "input": command,
+        # 放完整训练提示词，不是裸命令——实测 AUC 0.9922 → 0.9994，
+        # 误拦 12 → 2（见 `decision_input` 的说明）
+        "input": decision_input(command),
         "questions": [{"type": "choice", "name": "risk",
                        "instructions": INSTRUCTIONS, "choices": list(LABELS)}],
     }).encode()
