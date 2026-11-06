@@ -123,22 +123,28 @@ def cmd_fit(args) -> int:
     X, y = tr["feats"], tr["labels"]
     va = np.load(args.valid) if args.valid else None
 
-    # 特征先标准化。骨干输出的各维尺度差很远，不归一化的话 L2 正则对不同维度
-    # 的惩罚强度完全不同，学出来的头会偏向大尺度那几维。
-    mu, sd = X.mean(0), X.std(0) + 1e-6
-    Xn = (X - mu) / sd
+    # 只按尺度归一，**不去均值，也不要 bias**。
+    #
+    # oMLX 算的是裸的 `hidden @ W.T`——没有 bias，也没有地方放 mu/sd。
+    # 只缩放时 `W·(x/σ) = (W/σ)·x`，可以精确折进权重；一旦去均值，展开就多出
+    # 一个 `-W·(μ/σ)` 的**逐类**常数，而逐类常数就是先验平移，softmax 下不等价。
+    # 实测它能到 91.6，直接主导三档之间的大小关系。
+    #
+    # 归一本身要保留：骨干输出各维尺度差很远，不归一的话 L2 对不同维度的惩罚
+    # 强度完全不同，学出来的头会偏向大尺度那几维。
+    sd = X.std(0) + 1e-6
+    Xn = X / sd
 
     Xm, ym = mx.array(Xn), mx.array(y.astype(np.int32))
     W = mx.zeros((len(LABELS), HIDDEN))
-    b = mx.zeros((len(LABELS),))
 
     # 类别加权：插件只自动执行 SAFE，把非 SAFE 判成 SAFE 才是真漏放。
     # 不加权的话占比最大的那一类会主导，而我们对三类的代价并不对称。
     counts = np.bincount(y, minlength=len(LABELS)).astype(np.float64)
     cw = mx.array((counts.sum() / (len(LABELS) * np.maximum(counts, 1))).astype(np.float32))
 
-    def loss_fn(W, b):
-        logits = Xm @ W.T + b
+    def loss_fn(W):
+        logits = Xm @ W.T
         ll = logits - mx.logsumexp(logits, axis=1, keepdims=True)
         picked = mx.take_along_axis(ll, ym[:, None], axis=1).squeeze(1)
         w = cw[ym]
@@ -147,17 +153,16 @@ def cmd_fit(args) -> int:
     import mlx.optimizers as optim
 
     opt = optim.Adam(learning_rate=args.lr)
-    grad_fn = mx.value_and_grad(loss_fn, argnums=(0, 1))
+    grad_fn = mx.value_and_grad(loss_fn)
     for step in range(args.steps):
-        loss, (gW, gb) = grad_fn(W, b)
-        W, b = opt.apply_gradients({"W": gW, "b": gb}, {"W": W, "b": b}).values()
-        mx.eval(W, b)
+        loss, gW = grad_fn(W)
+        (W,) = opt.apply_gradients({"W": gW}, {"W": W}).values()
+        mx.eval(W)
         if (step + 1) % max(args.steps // 8, 1) == 0:
             print(f"  step {step+1:>5}  loss {float(loss):.4f}", flush=True)
 
     def score(Z, yy, tag):
-        Zn = (Z - mu) / sd
-        pred = np.asarray((mx.array(Zn) @ W.T + b).tolist()).argmax(1)
+        pred = np.asarray((mx.array(Z / sd) @ W.T).tolist()).argmax(1)
         leak = int(((pred == 0) & (yy != 0)).sum())
         block = int(((pred != 0) & (yy == 0)).sum())
         mis = int((pred != yy).sum()) - leak - block
@@ -168,20 +173,18 @@ def cmd_fit(args) -> int:
     if va is not None:
         score(va["feats"], va["labels"], "验证集")
 
-    # 打包成 [255, 1024]：前 3 行是我们的三档，其余留零。
-    # 标准化要折进权重里——oMLX 只做 `hidden @ W.T`，没有地方放 mu/sd。
+    # 打包成 [255, 1024]：前 3 行是三档，其余留零（oMLX 取 logits[:count]）。
+    # 缩放折进权重，无残差——这是上面不去均值的全部理由。
     Wn = np.asarray(W.tolist(), dtype=np.float64) / sd[None, :]
-    bn = np.asarray(b.tolist(), dtype=np.float64) - (np.asarray(W.tolist(), dtype=np.float64) * (mu / sd)[None, :]).sum(1)
-    if np.abs(bn).max() > 1e-6:
-        # oMLX 的 readout 没有 bias 项。把偏置吸收不进去就会和本地对不上，
-        # 所以这里不能悄悄丢掉——宁可报出来。
-        print(f"⚠ 偏置非零（最大 {np.abs(bn).max():.4f}），oMLX 的 readout 无 bias；"
-              f"用 --no-bias 重训，或接受这点偏差（只影响三档之间的常数平移，"
-              f"softmax 下等价于改变先验）")
     full = np.zeros((N_CODES, HIDDEN), dtype=np.float32)
     full[: len(LABELS)] = Wn.astype(np.float32)
     np.save(args.out, full)
-    np.savez(str(args.out) + ".norm.npz", mu=mu, sd=sd, bias=bn)
+    # 自检：折完之后本地用原始特征算一遍，和训练时的 argmax 必须完全一致。
+    # 这一步是在挡「折权重时算错了」这类静默错误——真发生过（逐类偏置 91.6）。
+    chk = (X @ Wn.T).argmax(1)
+    ref = np.asarray((mx.array(X / sd) @ W.T).tolist()).argmax(1)
+    agree = float((chk == ref).mean())
+    print(f"  折权重自检：{agree:.1%} 一致" + ("" if agree == 1.0 else "  ★ 不一致，别打包"))
     print(f"✓ {args.out}  {full.shape}")
     return 0
 
