@@ -664,6 +664,92 @@ def build_chains(
     return picked
 
 
+
+# ── 动词家族的对照对体检 ────────────────────────────────────────────────
+#
+# 这个项目已经在**三个**不同维度上栽过同一个跟头：数据在哪里给了对照对，模型
+# 就在哪里学会看作用目标；没给的地方一律退化成关键词反射。
+#
+#   作用目标轴  v7 对 `ssh deploy@prod-host` 判 SAFE 九次，因为训练里见过
+#               prod-host；没见过的 `ssh qa-02` 判 DANGEROUS 十一次。
+#   删除家族    307 条含 `rm` 的样本**全部** DANGEROUS，于是
+#               `rm -rf node_modules`（`pnpm install` 就能恢复）也被拦。
+#   数据库迁移  本地 `prisma migrate dev` 判 DANGEROUS。
+#
+# 反证也很干净：`chmod` 和 `>` 重定向**两侧都有样本**，模型就准确地把项目内
+# 判 SAFE、把 `/etc/passwd`、`/etc/hosts` 判 DANGEROUS，3/3。
+#
+# 所以把「这个家族有没有对照对」做成会报警的数字。和危险链式占比、
+# `--safe-target` 自动配平一样：靠注释提醒人回头看，三次都忘了。
+#
+# **豁免表必须写理由。** 只报「单标签」会狼来了——有些家族本来就该单标签，
+# 和作用目标无关。报了假警，下次真警也会被忽略。
+SINGLE_LABEL_OK = {
+    "git reset --hard": "总是丢弃未提交改动，和作用目标无关",
+    "export SECRET":    "泄密与目标无关，导出到哪儿都是泄密",
+    "curl|bash":        "下载并执行远程代码，与主机无关",
+}
+
+#: 提示词里逐条点名的动词家族 → 匹配正则
+VERB_FAMILIES = {
+    "rm":                r"(^|[;&|]\s*|\n\s*)(sudo\s+)?rm\b",
+    "find -delete":      r"\bfind\b.*-delete\b",
+    "git clean":         r"\bgit clean\b",
+    "git reset --hard":  r"\bgit reset --hard\b",
+    "db migrate":        r"\b(prisma (migrate|db push)|alembic|flyway)\b",
+    "chmod":             r"\bchmod\b",
+    "redirect-overwrite": r"(^|\s)>\s*\S",
+    "export SECRET":     r"\bexport \w*(KEY|TOKEN|SECRET|PASSWORD)\w*=",
+    "curl|bash":         r"curl[^|]*\|\s*(ba)?sh\b",
+    "docker lifecycle":  r"\bdocker\b.*\b(restart|stop|start)\b",
+    "kubectl":           r"\bkubectl\b",
+    "pkg add/remove":    r"\b(pnpm|npm|yarn)\s+(install|add|remove|uninstall)\b",
+    "git commit/push":   r"\bgit (commit|push)\b",
+    "ssh":               r"(^|[;&|]\s*)ssh\b",
+    "helm":              r"\bhelm\b",
+    "killall/pkill":     r"\b(killall|pkill)\b",
+}
+
+#: 少数侧低于这个比例就认为没有有效对照。10% 的来历：`pkg add/remove` 少数侧
+#: 12.4% 时模型判得准，`db migrate` 8.8% 时就退化了。
+MIN_MINORITY = 0.10
+
+
+def check_verb_families(train: list[dict]) -> list[str]:
+    """返回缺对照对的家族说明（空表示通过）。"""
+    pairs = []
+    for row in train:
+        match = COMMAND_BLOCK.search(row["messages"][0]["content"])
+        if match:
+            pairs.append((match.group(1), row["messages"][-1]["content"].strip()))
+
+    problems = []
+    print(f"\n动词家族对照体检（少数侧 < {MIN_MINORITY:.0%} 即报警）")
+    print(f"  {'家族':<20}{'n':>6}{'SAFE':>7}{'RISKY':>7}{'DANGER':>8}   ")
+    for family, pattern in VERB_FAMILIES.items():
+        rx = re.compile(pattern)
+        counts = Counter(label for command, label in pairs if rx.search(command))
+        total = sum(counts.values())
+        if not total:
+            continue
+        safe = counts["SAFE"]
+        blocked = counts["RISKY"] + counts["DANGEROUS"]
+        minority = min(safe, blocked) / total
+        if minority >= MIN_MINORITY:
+            note = "✓"
+        elif family in SINGLE_LABEL_OK:
+            note = f"— 豁免：{SINGLE_LABEL_OK[family]}"
+        else:
+            note = f"★ 少数侧仅 {minority:.1%}，模型会退化成关键词"
+            problems.append(f"{family}（{minority:.1%}）")
+        print(f"  {family:<20}{total:>6}{safe:>7}{counts['RISKY']:>7}"
+              f"{counts['DANGEROUS']:>8}   {note}")
+    if problems:
+        print(f"  ⚠ 缺对照对：{', '.join(problems)}"
+              f"——这些家族的判断会只看动词不看作用目标")
+    return problems
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-dir", type=Path, default=Path("data/processed"))
@@ -1083,6 +1169,8 @@ def main() -> int:
     for name, rows in [("train", train), ("valid", valid)]:
         counts = Counter(row["messages"][-1]["content"] for row in rows)
         print(f"{name}: {len(rows)} {dict(counts)}")
+
+    check_verb_families(train)
 
     # 危险链式的占比是这个项目最容易被无声稀释的东西。
     #
