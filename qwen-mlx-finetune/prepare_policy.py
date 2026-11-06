@@ -967,12 +967,20 @@ def main() -> int:
     # 所以这里给**目标份额**，由 `solve_repeats()` 反解需要多少行。零和关系
     # 变成一次联立求解，而不是一轮一轮试。
     #
-    # 0.24 / 0.05 的来历：v13 的 env 份额是 23.7%，它在所有已训版本里验证集
-    # 漏放最少（3）、AUC 最高（0.9825）。path_axis 是新加的，5% 是让它每种形态
-    # 都有足够样本的下限，没有历史数据支撑，先这么定。
+    # 0.24 的来历：v13 的 env 份额是 23.7%，它在所有已训版本里验证集漏放最少
+    # （3）、AUC 最高（0.9825）。
+    #
+    # path 的 0.18 是 v15 实测调上来的。第一版定 0.06（落地 4.7%），当时写的是
+    # 「没有历史数据支撑，先这么定」。v15 跑完有数据了，而且份额和能力大致单调：
+    #
+    #     env 轴   份额 23.4%  →  argmax 77.1%  AUC 0.9784  ECE 0.169
+    #     path 轴  份额  4.7%  →  argmax 52.3%  AUC 0.9147  ECE 0.422
+    #
+    # path 轴是三条轴里最弱的一环，而它的份额也正好是最低的。提到 0.18 让它和
+    # env 轴同量级；再高就会把 env 和链式挤下去（份额零和，见 `to_share`）。
     parser.add_argument("--env-axis-share", type=float, default=0.24,
                         help="作用目标对照组占训练集的目标比例")
-    parser.add_argument("--path-axis-share", type=float, default=0.06,
+    parser.add_argument("--path-axis-share", type=float, default=0.18,
                         help="作用路径对照组占训练集的目标比例")
     parser.add_argument("--env-axis-valid", type=int, default=200,
                         help="往验证集里放多少条对照组；验证集总共才四百条，"
