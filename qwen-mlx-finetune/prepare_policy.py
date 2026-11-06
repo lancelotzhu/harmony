@@ -31,6 +31,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 import env_axis
+import path_axis
 from policy_prompt import POLICY_PROMPT
 from prepare_authoritative import (
     DATASET_ID,
@@ -258,6 +259,19 @@ PROD_DANGEROUS_AUGMENT = [
     "fly deploy --app my-app-production",
     "gcloud sql instances patch prod-db --tier=db-f1-micro",
 ]
+# `git clean` 的对照对在 `-n` / `--dry-run` 上。
+#
+# 动词家族体检报警它 0% 少数侧。这个家族确实没有「作用目标」维度——`git clean`
+# 删的永远是当前工作区的未跟踪文件——但它有**干跑**这个维度，而且这是个真实
+# 区别：`-n` 只列不删。不给对照，模型会把 `git clean -n` 也拦掉。
+GIT_CLEAN_SAFE_AUGMENT = [
+    "git clean -n",
+    "git clean -nd",
+    "git clean --dry-run",
+    "git clean -nd --exclude=.env",
+    "git clean -ndx",
+    "git clean -n -- src",
+]
 GIT_FORCE_AUGMENT = [
     "git push --force",
     "git push --force origin main",
@@ -317,6 +331,35 @@ DB_AUGMENT = (
         ("mongosh --eval 'db.audit.drop()'", "DANGEROUS"),
         ("psql -c 'DROP TABLE users;'", "DANGEROUS"),
     ]
+    # ── 迁移也要按作用目标分档，不能一律 DANGEROUS ──────────────────
+    #
+    # 动词家族体检 2026-11-06 报警：这个家族少数侧只有 8.6%，模型退化成
+    # 「看见 migrate 就拦」。实测本地 `prisma migrate dev` 也判 DANGEROUS。
+    #
+    # 分档理由：
+    #   SAFE   只看不改——`status` / `diff` / `--dry-run`。
+    #   RISKY  本地开发库的迁移。**不是 SAFE**：迁移能跑回去，但本地种子数据
+    #          可能没了，而那不在 git 里。可恢复性介于两者之间，正好是 RISKY。
+    #   DANGEROUS 指向生产的。和 env_axis 同一条轴，只是换了个动词家族。
+    + [
+        ("prisma migrate status", "SAFE"),
+        ("prisma migrate diff --from-schema-datamodel schema.prisma", "SAFE"),
+        ("npx prisma migrate status", "SAFE"),
+        ("alembic current", "SAFE"),
+        ("alembic history", "SAFE"),
+        ("flyway info", "SAFE"),
+        ("liquibase status", "SAFE"),
+        ("python manage.py showmigrations", "SAFE"),
+        ("rails db:migrate:status", "SAFE"),
+        ("npx drizzle-kit check", "SAFE"),
+        ("DATABASE_URL=postgres://localhost:5432/app_dev prisma migrate dev", "RISKY"),
+        ("DATABASE_URL=postgres://127.0.0.1/app_dev alembic upgrade head", "RISKY"),
+        ("docker compose exec db psql -U dev -d app_dev -c 'SELECT 1'", "SAFE"),
+        ("DATABASE_URL=$PROD_DATABASE_URL prisma migrate deploy", "DANGEROUS"),
+        ("DATABASE_URL=$PRODUCTION_DB_URL alembic upgrade head", "DANGEROUS"),
+        ("psql $PROD_DATABASE_URL -c 'DROP TABLE sessions;'", "DANGEROUS"),
+        ("kubectl --context prod exec deploy/api -- rails db:migrate", "DANGEROUS"),
+    ]
     # Contrast: codegen and read-only inspection stay SAFE.
     + [(f"{r}prisma generate", "SAFE") for r in _RUNNERS]
     + [
@@ -336,8 +379,27 @@ DB_AUGMENT = (
 #   export SECRET=    1 条     →  2 条漏放
 # 和 v5 那轮「git clean 只有 6 条必漏、扩到 204 条就修好」是同一条规律。
 
-_DEL_PATHS = ["node_modules", "dist", "build", "logs", "target", "vendor",
-              ".cache", "tmp", "./src", "../shared", "$BASE", "$TMPDIR", "out"]
+# 删除目标的分档**由 `path_axis.py` 说了算**，这里只留它不管的那些。
+#
+# 重叠会直接打架：`find node_modules -name '*.log' -delete` 在这里是 DANGEROUS，
+# 在 path_axis 里是 SAFE（node_modules 可重建，插件的 REBUILDABLE_COMPONENTS
+# 本来就自动放行它）。冲突消解那一步会报错停下——2026-11-06 第一次合并就撞上了。
+#
+# 剩下的这几个 path_axis 确实不管：`../shared` 出了项目，`$BASE` / `$TMPDIR`
+# 解析不出落点，`logs` / `vendor` / `tmp` 没进可重建白名单。
+_PATH_AXIS_OWNED = {
+    name
+    for split in ("train", "valid", "test")
+    for name in (
+        path_axis._REBUILDABLE[split] + path_axis._BUILD_OUT[split] + path_axis._SOURCE[split]
+    )
+}
+_DEL_PATHS = [
+    p for p in ["node_modules", "dist", "build", "logs", "target", "vendor",
+                ".cache", "tmp", "./src", "../shared", "$BASE", "$TMPDIR", "out"]
+    # `removeprefix` 而不是 `lstrip`：后者逐字符剥，会把 `.cache` 剥成 `cache`
+    if p.removeprefix("./") not in _PATH_AXIS_OWNED
+]
 _DEL_GLOBS = ["'*.log'", "'*.tmp'", "'*.bak'", "'*.pyc'", "'*.o'", "'*~'",
               "'.DS_Store'", "'*.swp'"]
 DELETE_AUGMENT = (
@@ -750,6 +812,97 @@ def check_verb_families(train: list[dict]) -> list[str]:
     return problems
 
 
+
+# ── 份额不变量：防止「修好一个家族、挤掉另一个」 ──────────────────────
+#
+# 上面那个 `check_verb_families` 看的是家族**内部**的 SAFE / 拦截比例。
+# 它挡不住另一种事故——**新数据把老家族挤小了**。
+#
+# v14 就是这么坏掉的。为了修 v13 的链式漏放，把危险链式从 18.8% 提到 26.4%，
+# 总行数 12862 → 17065，于是作用目标对照组**从 23.7% 被挤到 18.8%**：
+#
+#             env_axis 占比   危险链式占比   验证集漏放   AUC
+#   v13         23.7%          18.8%           3        0.9825
+#   v14         18.8%          26.4%          13        0.9573
+#
+# v14 的漏放几乎全是 `--context live`（验证集里语义最远的那组生产词）。
+# 两个守卫都没报警：链式占比守卫只管自己那一项，动词家族 lint 只看家族内部比例。
+# **没有任何东西在看家族之间的此消彼长。**
+#
+# 这是同一个机制第四次出现，前三次分别是环境轴挤掉链式、rm 没对照对、
+# db migrate 没对照对。一个一个修就是打地鼠——必须同时约束。
+#
+# 做法：把各家族占比记在 `data/shares.json` 里当基线，每次生成对照。
+# 掉得超过容差就报警，并指出该调哪个参数。基线要显式更新（`--update-shares`），
+# 不能悄悄跟着漂——否则它就退化成「记录现状」，什么也挡不住。
+SHARES_FILE = Path("data/shares.json")
+
+#: 允许的相对跌幅。0.10 = 掉 10% 以内不报警。
+#: v14 那次是掉了 21%（23.7% → 18.8%），所以 10% 能抓住。
+SHARE_TOLERANCE = 0.10
+
+#: 家族 → 该调哪个参数把它拉回来
+SHARE_KNOBS = {
+    "env_axis": "--env-axis-repeat",
+    "path_axis": "--path-axis-repeat",
+    "dangerous_chains": "--chain-danger / --chain-bare-danger",
+    "path_axis": "--path-axis-repeat",
+}
+
+
+def family_shares(train: list[dict]) -> dict[str, float]:
+    """各家族占训练集的比例。**按整份数据算**，不是按某个来源算。"""
+    pairs = []
+    for row in train:
+        match = COMMAND_BLOCK.search(row["messages"][0]["content"])
+        if match:
+            pairs.append((match.group(1), row["messages"][-1]["content"].strip()))
+    total = max(len(pairs), 1)
+
+    env = {c for c, _l, _t, _p in env_axis.build("train")}
+    pth = {c for c, _l, _t, _p in path_axis.build("train")}
+    chain = re.compile(r"[;&|]|\n")
+    out = {
+        "env_axis": sum(1 for c, _ in pairs if c in env) / total,
+        "path_axis": sum(1 for c, _ in pairs if c in pth) / total,
+        "dangerous_chains": sum(1 for c, l in pairs if chain.search(c) and l != "SAFE") / total,
+    }
+    for family, pattern in VERB_FAMILIES.items():
+        rx = re.compile(pattern)
+        out[f"verb:{family}"] = sum(1 for c, _ in pairs if rx.search(c)) / total
+    return out
+
+
+def check_shares(train: list[dict], update: bool) -> list[str]:
+    shares = family_shares(train)
+    if update or not SHARES_FILE.is_file():
+        SHARES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        SHARES_FILE.write_text(json.dumps(shares, indent=2, sort_keys=True) + "\n")
+        print(f"\n已写入份额基线 {SHARES_FILE}（{len(shares)} 个家族）")
+        return []
+
+    base = json.loads(SHARES_FILE.read_text())
+    problems = []
+    print(f"\n份额不变量（对照 {SHARES_FILE}，相对跌幅 > {SHARE_TOLERANCE:.0%} 报警）")
+    for name, now in sorted(shares.items()):
+        was = base.get(name)
+        if was is None:
+            print(f"  + {name:<28}{now:>7.1%}  新家族，未进基线")
+            continue
+        drop = (was - now) / was if was else 0.0
+        if drop > SHARE_TOLERANCE:
+            knob = SHARE_KNOBS.get(name, "对应的 augment 条数")
+            problems.append(f"{name} {was:.1%}→{now:.1%}（跌 {drop:.0%}）")
+            print(f"  ★ {name:<28}{was:>7.1%} → {now:<7.1%} 跌 {drop:>4.0%}  调大 {knob}")
+        elif abs(drop) > 0.02:
+            print(f"    {name:<28}{was:>7.1%} → {now:<7.1%} {-drop:>+5.0%}")
+    if problems:
+        print(f"  ⚠ {len(problems)} 个家族被挤小了。v14 就是这么坏的："
+              f"修链式的同时把作用目标轴从 23.7% 挤到 18.8%，验证集漏放 3 → 13。")
+        print(f"    确认是有意调整就加 --update-shares 重写基线。")
+    return problems
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-dir", type=Path, default=Path("data/processed"))
@@ -775,7 +928,7 @@ def main() -> int:
                         help="SAFE 侧下采样到这么多行；0=自动，按 RISKY+DANGEROUS 的总数配平")
     parser.add_argument("--rebuild-test", action="store_true",
                         help="重新抽样测试集。默认沿用已有文件——换基准会让历史成绩全部不可比")
-    # 2026-11-06：250/400/500 → 1300/1300/1700。
+    # 2026-11-06：250/400/500 → 2400/1750/2300。
     #
     # 不是因为链式本身要加强，是因为**加别的东西会把它稀释**，而这个项目已经
     # 记过「漏放率跟同一形态的相对权重走」。加进 3120 行作用目标对照组之后：
@@ -793,11 +946,11 @@ def main() -> int:
     # **以后每次往训练集加一批新形态，都要回头看一眼这三个数。**
     # 和 `--safe-target` 那个教训一样，靠人记住就一定会忘——所以下面
     # 生成完会打印危险链式占比，低于 24% 直接警告。
-    parser.add_argument("--chain-safe", type=int, default=1300)
-    parser.add_argument("--chain-danger", type=int, default=1300)
+    parser.add_argument("--chain-safe", type=int, default=2400)
+    parser.add_argument("--chain-danger", type=int, default=1750)
     parser.add_argument("--chain-pool", type=int, default=400,
                         help="链式素材从全量上游池按哈希取这么多条，与训练采样解耦")
-    parser.add_argument("--chain-bare-danger", type=int, default=1700,
+    parser.add_argument("--chain-bare-danger", type=int, default=2300,
                         help="Chains whose dangerous segment is a short bare command "
                              "and never the first segment")
     parser.add_argument("--augment-repeat", type=int, default=6,
@@ -805,12 +958,29 @@ def main() -> int:
     # 作用目标对照组**不跟** `--augment-repeat`。
     # 复制 6 份是给只有十来条的稀有形态配重用的；env_axis 自带两千多条、
     # 本身就是多样的，再乘 6 会把训练集撑到两倍多，而且会让这一条轴压过别的。
-    parser.add_argument("--env-axis-repeat", type=int, default=1,
-                        help="作用目标对照组的重复次数（它本身已经够大，默认不放大）")
+    # 目标份额，不是重复次数。
+    #
+    # 份额之间是**零和**的：分母是整份数据，放大任何一个家族都会压小其他家族。
+    # 手调重复次数去凑份额，每轮要 4.5 小时训练才知道对不对——v14 就是这么
+    # 坏掉的（修链式的同时把 env 轴从 23.7% 挤到 18.8%，验证集漏放 3 → 13）。
+    #
+    # 所以这里给**目标份额**，由 `solve_repeats()` 反解需要多少行。零和关系
+    # 变成一次联立求解，而不是一轮一轮试。
+    #
+    # 0.24 / 0.05 的来历：v13 的 env 份额是 23.7%，它在所有已训版本里验证集
+    # 漏放最少（3）、AUC 最高（0.9825）。path_axis 是新加的，5% 是让它每种形态
+    # 都有足够样本的下限，没有历史数据支撑，先这么定。
+    parser.add_argument("--env-axis-share", type=float, default=0.24,
+                        help="作用目标对照组占训练集的目标比例")
+    parser.add_argument("--path-axis-share", type=float, default=0.06,
+                        help="作用路径对照组占训练集的目标比例")
     parser.add_argument("--env-axis-valid", type=int, default=200,
                         help="往验证集里放多少条对照组；验证集总共才四百条，"
                              "放太多会让 checkpoint 选择被这一条轴主导")
     parser.add_argument("--env-axis-test", type=int, default=200)
+
+    parser.add_argument("--path-axis-test-output", type=Path,
+                        default=Path("eval/policy-test-path.jsonl"))
     parser.add_argument("--env-axis-test-output", type=Path,
                         default=Path("eval/policy-test-env.jsonl"),
                         help="三档测试集单独一个文件。原来那份 280 条的测试集保持冻结"
@@ -827,6 +997,9 @@ def main() -> int:
                              "实测 batch 2 在 950 token 上必 OOM、900 通过，880 是留了余量的值")
     parser.add_argument("--tokenizer", default="Qwen/Qwen3.5-0.8B-Base",
                         help="只用来量长度，要和训练用的基座一致")
+    parser.add_argument("--update-shares", action="store_true",
+                        help="把当前各家族占比写成新基线。**只在有意重新配平时用**——"
+                             "基线悄悄跟着漂就等于没有守卫")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -884,11 +1057,16 @@ def main() -> int:
     # 手滑撞上了，这里会直接报错而不是悄悄虚高分数。
     if problems := env_axis.check_disjoint():
         raise SystemExit("env_axis 词表冲突：" + "；".join(problems))
+    if problems := path_axis.check_disjoint():
+        raise SystemExit("path_axis 词表冲突：" + "；".join(problems))
     env_train = env_axis.build("train")
     env_valid = env_axis.build("valid", args.env_axis_valid, dedupe=True)
     env_test = env_axis.build("test", args.env_axis_test, dedupe=True)
+    path_train = path_axis.build("train")
+    path_valid = path_axis.build("valid", dedupe=True)
+    path_test = path_axis.build("test", dedupe=True)
 
-    frozen_eval: set[str] = {c for c, _l, _t, _p in env_valid + env_test}
+    frozen_eval: set[str] = {c for c, _l, _t, _p in env_valid + env_test + path_valid + path_test}
     for extra in [args.holdout, *(args.eval_sets or [])]:
         if extra and extra.is_file():
             for row in read_jsonl(extra):
@@ -951,7 +1129,9 @@ def main() -> int:
         (c, "SAFE", "local_dev_safe_augment") for c in LOCAL_DEV_SAFE_AUGMENT
     ] + [(c, "DANGEROUS", "prod_dangerous_augment") for c in PROD_DANGEROUS_AUGMENT] + [
         (c, "DANGEROUS", "cred_file_augment") for c in CRED_FILE_AUGMENT
-    ] + [(c, "SAFE", "cred_file_safe_augment") for c in CRED_FILE_SAFE_AUGMENT]
+    ] + [(c, "SAFE", "cred_file_safe_augment") for c in CRED_FILE_SAFE_AUGMENT] + [
+        (c, "SAFE", "git_clean_safe_augment") for c in GIT_CLEAN_SAFE_AUGMENT
+    ]
 
     # 从训练里剔掉两类命令:
     #   1. 留出集那 12 条——上一轮把其中 4 条原样训了进去，留出集就成了考记忆
@@ -980,9 +1160,8 @@ def main() -> int:
     # 本地容器和生产集群，而这正是这组数据要教的东西。
     env_rows = [(c, l, "env_axis_augment") for c, l, _t, _p in env_train
                 if c.strip() not in excluded]
-    augment += env_rows * args.env_axis_repeat
-    print(f"作用目标对照组：训练 {len(env_rows)}×{args.env_axis_repeat} 条，"
-          f"验证 {len(env_valid)} 条，测试 {len(env_test)} 条")
+    path_rows = [(c, l, "path_axis_augment") for c, l, _t, _p in path_train
+                 if c.strip() not in excluded]
 
     # 链式样本的素材池要和**训练采样无关**。
     #
@@ -1023,7 +1202,34 @@ def main() -> int:
     # `base_train`（本地 opencode 导出）也要一起参与冲突消解，它和上游一样
     # 可能和本项目的策略打架：`killall node` 的 DANGEROUS 就是从这里来的。
     base_rows = [(c, l, "base") for c, l in base_train if c.strip() not in excluded]
-    train_extra = base_rows + train_safe + train_danger + augment + chains
+    # ── 按目标份额把两组对照集放大到位 ─────────────────────────────
+    #
+    # **必须在这里算**，不能在 augment 阶段算：份额的分母是最终的训练集，
+    # 而链式、上游采样、`--augment-repeat` 加权都在后面。第一版就是在
+    # augment 阶段解的，`rest` 少算了一大截，目标 24% 解出来只有 7.9%。
+    #
+    # 份额之间零和：n/(n+rest) = share → n = rest·share/(1-share)。
+    # 两组一起算，所以 rest 是「两组都不算在内」的那部分。
+    rest_rows = base_rows + train_safe + train_danger + augment + chains
+
+    def to_share(rows: list, share: float, others: int) -> list:
+        """重复并截断到目标份额。只能整份重复，所以向上取整再截断——
+        反过来（向下取整）会让份额系统性偏低。"""
+        if not rows or share <= 0:
+            return []
+        want = round(others * share / (1 - share))
+        reps = max(1, -(-want // len(rows)))
+        return (rows * reps)[:want]
+
+    rest = len(rest_rows)
+    env_scaled = to_share(env_rows, args.env_axis_share, rest)
+    path_scaled = to_share(path_rows, args.path_axis_share, rest)
+    print(f"作用目标对照组：{len(env_rows)} → {len(env_scaled)} 行"
+          f"（目标 {args.env_axis_share:.0%}），验证 {len(env_valid)} 测试 {len(env_test)}")
+    print(f"作用路径对照组：{len(path_rows)} → {len(path_scaled)} 行"
+          f"（目标 {args.path_axis_share:.0%}），验证 {len(path_valid)} 测试 {len(path_test)}")
+
+    train_extra = rest_rows + env_scaled + path_scaled
 
     # 同一条命令被打上不同标签，两条样本会互相抵消——模型学到的是噪声。
     #
@@ -1106,6 +1312,44 @@ def main() -> int:
     # 都对「测试/生产从严」这半边策略完全失明——模型在这条轴上好不好，从来没有
     # 参与过任何一次选择。
     valid += [make_sample(prompt, c, l) for c, l, _t, _p in env_valid]
+    # 作用路径轴同理：验证集不含它，选 checkpoint 时就看不见 rm 的目标判断
+    valid += [make_sample(prompt, c, l) for c, l, _t, _p in path_valid]
+
+    # ── 验证集也要配平 SAFE : 拦截 ─────────────────────────────────
+    #
+    # 训练侧有 `--safe-target` 自动配平到 1:1，验证侧原来没有。追加进去的两组
+    # 对照集都是拦截侧偏重的（env 51 SAFE / 150 拦，path 15 / 50），于是验证集
+    # 变成 **1:1.81**，比训练集偏向拦截近一倍。
+    #
+    # 这会直接浪费训练：验证集同时承担**挑 checkpoint** 和**标定阈值**两件事，
+    # 偏斜让两件都系统性偏向拦截。v14 选出那个误拦 122 的 checkpoint，
+    # 这个偏斜是帮凶之一。
+    #
+    # **裁拦截侧，不补 SAFE。** 补 SAFE 要从上游验证池取，而不相交的候选只有
+    # 270 条，补到 1:1 得从训练池借 330 条——README 记过这笔账：v9 借走 191 条，
+    # history_rewrite 的红队漏放从 1 涨到 13。验证集的价值不值这个代价。
+    #
+    # 按**来源**分层裁：每一类按同一比例缩，env / path 对照组的代表性不会被裁掉。
+    def _label(row: dict) -> str:
+        return row["messages"][-1]["content"].strip()
+
+    safe_rows_v = [r for r in valid if _label(r) == "SAFE"]
+    blocked_rows_v = [r for r in valid if _label(r) != "SAFE"]
+    if len(blocked_rows_v) > len(safe_rows_v):
+        keep = len(safe_rows_v)
+        by_label: dict[str, list] = defaultdict(list)
+        for r in blocked_rows_v:
+            by_label[_label(r)].append(r)
+        trimmed: list[dict] = []
+        for label, rows_l in sorted(by_label.items()):
+            want = max(1, round(keep * len(rows_l) / len(blocked_rows_v)))
+            key = lambda row: json.dumps(row, ensure_ascii=False, sort_keys=True)  # noqa: E731
+            order = stable_order([key(r) for r in rows_l], args.seed, "valid-trim", label)
+            wanted = set(order[:want])
+            trimmed += [r for r in rows_l if key(r) in wanted]
+        print(f"验证集配平：拦截侧 {len(blocked_rows_v)} → {len(trimmed)} 条，"
+              f"SAFE : 拦截 = {len(safe_rows_v)} : {len(trimmed)}（按标签分层裁，不动训练集）")
+        valid = safe_rows_v + trimmed
 
     # 测试集已在上面切好（见那段「先切测试集」的说明）。这里只做一次保险:
     # 确认训练集真的没碰过测试命令，有重合就直接报错而不是悄悄算分。
@@ -1165,12 +1409,18 @@ def main() -> int:
         [dict(make_sample(prompt, c, l), expected=l, cmd=c, target=t, prox=p)
          for c, l, t, p in env_test],
     )
+    write_jsonl(
+        args.path_axis_test_output,
+        [dict(make_sample(prompt, c, l), expected=l, cmd=c, target=t, prox=p)
+         for c, l, t, p in path_test],
+    )
 
     for name, rows in [("train", train), ("valid", valid)]:
         counts = Counter(row["messages"][-1]["content"] for row in rows)
         print(f"{name}: {len(rows)} {dict(counts)}")
 
     check_verb_families(train)
+    check_shares(train, args.update_shares)
 
     # 危险链式的占比是这个项目最容易被无声稀释的东西。
     #
