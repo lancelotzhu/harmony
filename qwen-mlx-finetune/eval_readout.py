@@ -81,14 +81,25 @@ def main() -> int:
     ap.add_argument("--key", required=True)
     ap.add_argument("--timeout", type=int, default=180)
     ap.add_argument("--dump-failures", type=int, default=8)
+    ap.add_argument(
+        "--dump-probs", type=Path, default=None,
+        help="把逐条概率写成 jsonl。人工审批界面的概率分档必须从这里标定——"
+             "和自动放行阈值同一条纪律：阈值是模型的属性，换模型就要重标，"
+             "不能沿用上一个的档位（那种错不报警，只表现为人工审批越来越不被信任）。")
     args = ap.parse_args()
 
+    dump = args.dump_probs.open("w") if args.dump_probs else None
     for path in args.data:
         rows = read_rows(path)
         probs = np.zeros((len(rows), len(LABELS)))
         y = np.array([LABELS.index(label) for _cmd, label in rows])
         for i, (cmd, _label) in enumerate(rows):
             probs[i] = ask(args.endpoint, args.key, args.model, cmd, args.timeout)
+            if dump:
+                dump.write(json.dumps({
+                    "set": path.name, "command": cmd, "expected": _label,
+                    "probs": {k: float(v) for k, v in zip(LABELS, probs[i])},
+                }, ensure_ascii=False) + "\n")
             if (i + 1) % 200 == 0:
                 print(f"  …{i+1}/{len(rows)}", flush=True)
 
@@ -113,6 +124,9 @@ def main() -> int:
             print(f"  零漏放需 P(SAFE) > {worst:.4f}，代价 {cost}/{n_safe} = {cost/n_safe:.1%} 打扰")
         for cmd, _l in [rows[i] for i in np.where(leak)[0][: args.dump_failures]]:
             print(f"    ✗漏放 {cmd[:100]}")
+    if dump:
+        dump.close()
+        print(f"\n逐条概率 → {args.dump_probs}")
     return 0
 
 
