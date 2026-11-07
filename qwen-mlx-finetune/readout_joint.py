@@ -132,10 +132,23 @@ def main() -> int:
                          "没有 LM 头之后显存宽裕，比现行的 4 层多给一些")
     ap.add_argument("--rank", type=int, default=16)
     ap.add_argument("--lr", type=float, default=1e-4)
-    ap.add_argument("--head-lr", type=float, default=1e-3,
+    ap.add_argument("--head-lr", type=float, default=3e-4,
                     help="头是从零开始的，学习率要比 LoRA 高一个量级")
     ap.add_argument("--epochs", type=float, default=2.0)
-    ap.add_argument("--batch", type=int, default=4)
+    ap.add_argument("--batch", type=int, default=2)
+    # 梯度累积。batch 大小对吞吐没帮助（实测 batch 1/2/4 都是 0.65~0.74 s/样本，
+    # 训练模式关掉了快速核，回退路径线性），但**有效 batch 对稳定性是决定性的**。
+    #
+    # 第一版 batch 2 无累积，验证集在两个退化解之间来回弹：
+    #   step  500  全判 SAFE（漏放 166 / 误拦 1）
+    #   step 2000  全判拦截（漏放 0 / 误拦 166）
+    #   step 2500  又全判 SAFE
+    # 每步只看 2 个样本、类别权重最高 4.6×，梯度噪声压过信号。累积不增加
+    # 墙钟时间（同样的样本数），只是把更新变稳。
+    ap.add_argument("--accum", type=int, default=8,
+                    help="梯度累积步数；有效 batch = batch × accum")
+    ap.add_argument("--warmup", type=int, default=100,
+                    help="预热步数。头是从零起的，上来就满学习率会主导整个更新")
     ap.add_argument("--eval-every", type=int, default=200, help="每多少个优化步测一次验证集")
     ap.add_argument("--causal", action="store_true", help="因果对照组")
     ap.add_argument("--limit", type=int, default=0, help="只用前 N 条，冒烟用")
@@ -216,7 +229,7 @@ def main() -> int:
     # 大于省掉 LM 头的收益，所以批处理不是优化，是必须。
     batches = list(make_batches(tr, args.batch))
     steps_per_epoch = len(batches)
-    total = max(1, int(steps_per_epoch * args.epochs))
+    total = max(1, int(steps_per_epoch * args.epochs) // args.accum)
     rng = np.random.default_rng(args.seed)
 
     opt_lora = optim.AdamW(learning_rate=args.lr)
@@ -226,17 +239,28 @@ def main() -> int:
     best: tuple[int, int, float] | None = None
     best_acc = 0.0
     t0 = time.time()
-    print(f"每轮 {steps_per_epoch} 批（batch {args.batch}），共 {total} 步")
+    print(f"每轮 {steps_per_epoch} 批（batch {args.batch} × 累积 {args.accum} = "
+          f"有效 {args.batch * args.accum}），共 {total} 个优化步")
 
     for step in range(total):
-        if step % steps_per_epoch == 0:
-            rng.shuffle(batches)
+        warm = min(1.0, (step + 1) / max(args.warmup, 1))
+        decay = 0.5 * (1 + math.cos(math.pi * step / total))
         for opt, base in ((opt_lora, args.lr), (opt_head, args.head_lr)):
-            opt.learning_rate = base * 0.5 * (1 + math.cos(math.pi * step / total))
-        ids, lens, ys = batches[step % steps_per_epoch]
-        _loss, g = grad_fn(joint, ids, lens, ys)
-        opt_lora.update(model, g["backbone"])
-        opt_head.update(head, g["head"])
+            opt.learning_rate = base * warm * decay
+        gl = gh = None
+        for k in range(args.accum):
+            idx = step * args.accum + k
+            if idx % steps_per_epoch == 0:
+                rng.shuffle(batches)
+            ids, lens, ys = batches[idx % steps_per_epoch]
+            _loss, g = grad_fn(joint, ids, lens, ys)
+            gl = g["backbone"] if gl is None else nn.utils.tree_map(
+                lambda a, b: a + b, gl, g["backbone"])
+            gh = g["head"] if gh is None else nn.utils.tree_map(
+                lambda a, b: a + b, gh, g["head"])
+        scale = 1.0 / args.accum
+        opt_lora.update(model, nn.utils.tree_map(lambda t: t * scale, gl))
+        opt_head.update(head, nn.utils.tree_map(lambda t: t * scale, gh))
         mx.eval(state)
 
         if (step + 1) % args.eval_every == 0 or step + 1 == total:

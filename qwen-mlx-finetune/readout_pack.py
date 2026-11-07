@@ -79,8 +79,26 @@ def main() -> int:
     ap.add_argument("--dst", type=Path, required=True)
     ap.add_argument("--attention-mode", default="causal",
                     choices=("causal", "noncausal_full_attention"))
+    # oMLX 服务端做 softmax(logits/T)。
+    #
+    # **两次标定都给出同一个结论：全局温度在这里是负收益，保持 1.0。**
+    #
+    # 在验证集上拟合，ECE 从 0.2015 降到 0.0482（T=6）看着很好，但拿到测试集上：
+    #
+    #                 ECE @T=1   ECE @T=4
+    #   policy-test     0.0238     0.1994   ← 变差
+    #   env 轴          0.3523     0.1736
+    #   path 轴         0.1841     0.0862
+    #
+    # 验证集堆满了 env/path 两条难轴，在它上面拟合的全局标量会过度压平容易的
+    # 那一侧——而 policy-test 在 T=1 时本来就标定得很好。真实使用分布更像
+    # policy-test：273 条真实命令里走到模型的 93 条是日常开发命令，不是构造样本。
+    # 零漏放代价也一致变差（2.7%→3.3%、9.8%→11.8%）。
+    #
+    # v13 那轮得出过同样结论，只是当时幅度更大。要改善 env/path 的标定，
+    # 得靠数据，不是靠一个标量。
     ap.add_argument("--temperature", type=float, default=1.0,
-                    help="oMLX 服务端做 softmax(logits/T)。在**验证集**上标定后写这里")
+                    help="oMLX 服务端做 softmax(logits/T)。默认 1.0——实测全局温度负收益")
     args = ap.parse_args()
 
     args.dst.mkdir(parents=True, exist_ok=True)
