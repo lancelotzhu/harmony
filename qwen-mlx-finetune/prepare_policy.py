@@ -32,6 +32,7 @@ from pathlib import Path
 
 import env_axis
 import path_axis
+import payload_axis
 from policy_prompt import POLICY_PROMPT
 from prepare_authoritative import (
     DATASET_ID,
@@ -360,6 +361,22 @@ DB_AUGMENT = (
         ("psql $PROD_DATABASE_URL -c 'DROP TABLE sessions;'", "DANGEROUS"),
         ("kubectl --context prod exec deploy/api -- rails db:migrate", "DANGEROUS"),
     ]
+    # ⚠️ 乘子必须对称地给两侧。危险侧的四条迁移命令各自乘了一遍 `_RUNNERS`
+    # （`npx` / `pnpm exec` / `yarn` …），安全侧原来全是单条字面量，于是同一个
+    # 家族里危险侧天然是安全侧的若干倍——2026-11-08 体检报到少数侧只剩 9.6%。
+    #
+    # 这就是这个项目反复栽的那个形状：**哪一侧有乘子，哪一侧就赢**。和份额、
+    # 唯一覆盖是同一回事，只是换了个层级。所以只读查询也照样乘一遍。
+    + [(f"{r}prisma migrate status", "SAFE") for r in _RUNNERS]
+    + [(f"{r}prisma migrate diff --from-empty --to-schema-datamodel schema.prisma",
+        "SAFE") for r in _RUNNERS]
+    + [(f"{r}drizzle-kit check", "SAFE") for r in _RUNNERS]
+    + [(f"{r}prisma validate", "SAFE") for r in _RUNNERS]
+    # 本地开发库的迁移是 RISKY，同样要有乘子，否则「本地」这一档只有两条
+    + [(f"DATABASE_URL=postgres://localhost:5432/app_dev {r}prisma migrate dev",
+        "RISKY") for r in _RUNNERS]
+    + [(f"DATABASE_URL=postgres://127.0.0.1:5432/app_dev {r}prisma db push",
+        "RISKY") for r in _RUNNERS]
     # Contrast: codegen and read-only inspection stay SAFE.
     + [(f"{r}prisma generate", "SAFE") for r in _RUNNERS]
     + [
@@ -686,16 +703,48 @@ def chainable(command: str) -> bool:
     return "\n" not in command and "#" not in command and len(command) <= 90
 
 
+#: 链的**形状**：(分隔符, 段数)。安全侧和危险侧共用同一张表。
+#
+# 2026-11-08 实测 v17：段数和标签是绑死的——1 段 53.0% SAFE、2 段 62.4%，到
+# 3 段直接掉到 **19.9%**，4 段 24.5%。分隔符同样，`&&` 50.2% 而换行只有 15.6%。
+# 原因在代码里一眼可见：安全链**永远**是 `A && B` 两段，危险链却有 2–4 段、
+# 还用换行和分号。于是「段数多 / 分隔符花」成了危险的代名词。
+#
+# 模型没学错，是数据这么教的。真实使用里 `pwd && pnpm exec tsc --noEmit`、
+# `pwd && git status --short && git diff --stat` 这类三段只读链被拦，正是这个
+# 混淆的直接后果——而 25757 条训练数据里 `pwd &&` 开头的只有 **2 条**。
+#
+# 修法不是「把安全链也调长一点」，那样下次改动又会漂。两侧**共用这张表**，
+# 形状和标签在构造上就无法相关。`check_shape_balance()` 把这件事钉成会报警的数字。
+CHAIN_SHAPES: tuple[tuple[str, int], ...] = (
+    (" && ", 2), (" && ", 3), (" && ", 4), (" && ", 5),
+    (" ; ", 2), (" ; ", 3), (" ; ", 4),
+    ("\n", 2), ("\n", 3), ("\n", 4),
+    (" || ", 2),
+)
+
+
+def chainable(command: str) -> bool:
+    """Single-line commands without comments can be joined without changing meaning."""
+    return "\n" not in command and "#" not in command and len(command) <= 90
+
+
 def build_chains(
     safe: list[str],
     danger: list[str],
     rng: random.Random,
     safe_n: int,
     danger_n: int,
-    styles: tuple[str, ...] = ("first", "middle", "last", "lines"),
+    shapes: tuple[tuple[str, int], ...] = CHAIN_SHAPES,
     reason: str = "chain_danger",
+    danger_can_lead: bool = True,
 ) -> list[tuple[str, str, str]]:
-    """Teach the chained-command rule with the dangerous part in every position."""
+    """Teach the chained-command rule with the dangerous part in every position.
+
+    Both labels draw their shape from `shapes`, so segment count and separator
+    carry no information about the label -- see the note on CHAIN_SHAPES for
+    what happens when they do.
+    """
     safe = [c for c in safe if chainable(c)]
     danger = [c for c in danger if chainable(c)]
     if not safe or not danger:
@@ -703,28 +752,23 @@ def build_chains(
 
     picked: list[tuple[str, str, str]] = []
     for _ in range(safe_n):
-        first, second = rng.sample(safe, 2)
-        picked.append((f"{first} && {second}", "SAFE", "chain_safe"))
+        sep, n = rng.choice(shapes)
+        # 取不重复的段：同一条命令出现两次是真实链里基本不会有的形态
+        segs = rng.sample(safe, min(n, len(safe)))
+        picked.append((sep.join(segs), "SAFE", "chain_safe"))
     for _ in range(danger_n):
-        benign = rng.choice(safe)
-        bad = rng.choice(danger)
-        style = rng.choice(styles)
-        if style == "first":
-            command = f"{bad} && {benign}"
-        elif style == "middle":
-            command = f"{benign} && {bad} && {benign}"
-        elif style == "last":
-            command = f"{benign} && {bad}"
-        elif style == "lines4":
-            other = rng.choice(safe)
-            command = f"{benign}\n{bad}\n{other}\n{rng.choice(safe)}"
-        elif style == "semi":
-            command = f"{benign} ; {bad} ; {rng.choice(safe)}"
-        else:
-            command = f"{benign}\n{bad}\n{benign}"
-        picked.append((command, "DANGEROUS", reason))
+        sep, n = rng.choice(shapes)
+        segs = rng.sample(safe, min(n - 1, len(safe)))
+        # 危险段放在**每一个**位置上都要出现：只放第一段的话，模型学会的是
+        # 「看开头」，而实测活下来的漏放里有一半危险段不在首位。
+        #
+        # `danger_can_lead=False` 则连首位都不放——bare 那批专门练「读过一个
+        # 看起来正常的开头」，让危险段偶尔落在首位会稀释掉这个训练意图。
+        lo = 0 if danger_can_lead else 1
+        segs.insert(rng.randrange(lo, len(segs) + 1) if len(segs) >= lo else lo,
+                    rng.choice(danger))
+        picked.append((sep.join(segs), "DANGEROUS", reason))
     return picked
-
 
 
 # ── 动词家族的对照对体检 ────────────────────────────────────────────────
@@ -843,11 +887,72 @@ SHARE_TOLERANCE = 0.10
 
 #: 家族 → 该调哪个参数把它拉回来
 SHARE_KNOBS = {
-    "env_axis": "--env-axis-repeat",
-    "path_axis": "--path-axis-repeat",
+    "env_axis": "--env-axis-share",
+    "path_axis": "--path-axis-share",
+    "payload_axis": "--payload-axis-share",
     "dangerous_chains": "--chain-danger / --chain-bare-danger",
-    "path_axis": "--path-axis-repeat",
 }
+
+
+# ── 形状不能携带标签信息 ────────────────────────────────────────────────
+#
+# 同一个跟头的第四次：数据在哪个维度上没给对照，模型就在那个维度上退化成反射。
+# 前三次是作用目标、删除家族、数据库迁移（见 SINGLE_LABEL_OK 上面那段），
+# 第四次是**命令的形状**。
+#
+# 2026-11-08 在 v17 上量出来：1 段 53.0% SAFE、2 段 62.4%、3 段 **19.9%**、
+# 4 段 24.5%；`&&` 50.2% 而换行只有 15.6%。因为安全链永远是 `A && B` 两段，
+# 危险链却有 2–4 段、还用换行和分号。于是模型把「段数多」当成了危险信号，
+# 真实使用里 `pwd && git status --short && git diff --stat` 这种三段只读链
+# 就被拦下来——它正是实测打扰里最大的一类。
+#
+# 现在两侧共用 CHAIN_SHAPES，构造上不该再相关；这里把它钉成会报警的数字，
+# 因为「构造上不该」挡不住以后有人单独调一侧。
+SHAPE_DRIFT_TOLERANCE = 0.15
+
+
+def shape_balance(pairs: list[tuple[str, str]]) -> dict[str, tuple[int, float]]:
+    """按形状分桶，报每桶的条数和 SAFE 占比。"""
+    buckets: dict[str, list[str]] = {}
+    seg = re.compile(r"&&|\|\||;|\n")
+    for cmd, label in pairs:
+        n = len(seg.split(cmd))
+        buckets.setdefault(f"段数 {min(n, 5)}{'+' if n >= 5 else ''}", []).append(label)
+    for pattern, name in ((r"&&", "分隔 &&"), (r"\n", "分隔 换行"),
+                          (r";", "分隔 分号"), (r"\|\|", "分隔 ||")):
+        rx = re.compile(pattern)
+        hit = [l for c, l in pairs if rx.search(c)]
+        if hit:
+            buckets[name] = hit
+    return {k: (len(v), sum(1 for l in v if l == "SAFE") / len(v)) for k, v in buckets.items()}
+
+
+def check_shape_balance(train: list[dict]) -> list[str]:
+    """形状桶之间的 SAFE 占比差得太多就报警。"""
+    pairs = []
+    for row in train:
+        match = COMMAND_BLOCK.search(row["messages"][0]["content"])
+        if match:
+            pairs.append((match.group(1), row["messages"][-1]["content"].strip()))
+    stats = shape_balance(pairs)
+    # 只比**多段**那几桶：单段和多段的 SAFE 占比本来就该不同（单段里有大量
+    # 裸危险命令），拿它们比是在比一个本来就不相等的东西
+    multi = {k: v for k, v in stats.items() if k.startswith("段数") and k != "段数 1"}
+    warnings: list[str] = []
+    print("\n形状 × SAFE 占比（形状不该携带标签信息）")
+    for name, (n, safe) in sorted(stats.items()):
+        print(f"  {name:<12}{n:>7} 条   SAFE {safe:>6.1%}")
+    if len(multi) >= 2:
+        lo = min(multi.values(), key=lambda v: v[1])
+        hi = max(multi.values(), key=lambda v: v[1])
+        if hi[1] - lo[1] > SHAPE_DRIFT_TOLERANCE:
+            warnings.append(
+                f"⚠ 多段链里各形状的 SAFE 占比相差 {hi[1] - lo[1]:.1%}"
+                f"（{lo[1]:.1%} ~ {hi[1]:.1%}），超过容忍的 {SHAPE_DRIFT_TOLERANCE:.0%}。"
+                f"模型会把形状当成标签信号——v17 正是这么把三段只读链学成危险的。")
+    for w in warnings:
+        print(w)
+    return warnings
 
 
 def family_shares(train: list[dict]) -> dict[str, float]:
@@ -861,10 +966,12 @@ def family_shares(train: list[dict]) -> dict[str, float]:
 
     env = {c for c, _l, _t, _p in env_axis.build("train")}
     pth = {c for c, _l, _t, _p in path_axis.build("train")}
+    pay = {c for c, _l, _t, _p in payload_axis.build("train")}
     chain = re.compile(r"[;&|]|\n")
     out = {
         "env_axis": sum(1 for c, _ in pairs if c in env) / total,
         "path_axis": sum(1 for c, _ in pairs if c in pth) / total,
+        "payload_axis": sum(1 for c, _ in pairs if c in pay) / total,
         "dangerous_chains": sum(1 for c, l in pairs if chain.search(c) and l != "SAFE") / total,
     }
     for family, pattern in VERB_FAMILIES.items():
@@ -946,11 +1053,20 @@ def main() -> int:
     # **以后每次往训练集加一批新形态，都要回头看一眼这三个数。**
     # 和 `--safe-target` 那个教训一样，靠人记住就一定会忘——所以下面
     # 生成完会打印危险链式占比，低于 24% 直接警告。
-    parser.add_argument("--chain-safe", type=int, default=2400)
-    parser.add_argument("--chain-danger", type=int, default=1750)
+    parser.add_argument("--chain-safe", type=int, default=4600,
+                        help="安全链条数（2400 → 4600）。三条约束要同时满足，"
+                             "解出来安全链和危险链必须同步加：危险链占比不低于 "
+                             "24%%、SAFE 与拦截侧先验 1:1、形状不携带标签信息。"
+                             "而且这里加的恰好是实测误拦最大的一类形态——多段"
+                             "只读链（`pwd && git status --short && git diff --stat`）")
+    parser.add_argument("--chain-danger", type=int, default=2400,
+                        help="危险链条数。1750 → 2000 是为了抵掉载荷轴 5%% 份额"
+                             "带来的稀释：份额是零和的，新轴占 5%% 就必然有人掉，"
+                             "而危险链掉的是**安全侧**——v17 的强项正是五个冻结集"
+                             "里四个零漏放，这一项不能让")
     parser.add_argument("--chain-pool", type=int, default=400,
                         help="链式素材从全量上游池按哈希取这么多条，与训练采样解耦")
-    parser.add_argument("--chain-bare-danger", type=int, default=2300,
+    parser.add_argument("--chain-bare-danger", type=int, default=3120,
                         help="Chains whose dangerous segment is a short bare command "
                              "and never the first segment")
     parser.add_argument("--augment-repeat", type=int, default=6,
@@ -983,10 +1099,14 @@ def main() -> int:
     #
     # path 轴是三条轴里最弱的一环，而它的份额也正好是最低的。提到 0.18 让它和
     # env 轴同量级；再高就会把 env 和链式挤下去（份额零和，见 `to_share`）。
-    parser.add_argument("--env-axis-share", type=float, default=0.24,
+    parser.add_argument("--env-axis-share", type=float, default=0.22,
                         help="作用目标对照组占训练集的目标比例")
-    parser.add_argument("--path-axis-share", type=float, default=0.10,
+    parser.add_argument("--path-axis-share", type=float, default=0.08,
                         help="作用路径对照组占训练集的目标比例")
+    parser.add_argument("--payload-axis-share", type=float, default=0.05,
+                        help="载荷对照组占训练集的目标比例。6%% 是跟 payload_axis "
+                             "的唯一覆盖（1068 条）配套定的，重复约 1.5×；"
+                             "往上调就要先把唯一覆盖加上去，否则又是同一道题抄更多遍")
     parser.add_argument("--env-axis-valid", type=int, default=200,
                         help="往验证集里放多少条对照组；验证集总共才四百条，"
                              "放太多会让 checkpoint 选择被这一条轴主导")
@@ -994,6 +1114,8 @@ def main() -> int:
 
     parser.add_argument("--path-axis-test-output", type=Path,
                         default=Path("eval/policy-test-path.jsonl"))
+    parser.add_argument("--payload-axis-test-output", type=Path,
+                        default=Path("eval/policy-test-payload.jsonl"))
     parser.add_argument("--env-axis-test-output", type=Path,
                         default=Path("eval/policy-test-env.jsonl"),
                         help="三档测试集单独一个文件。原来那份 280 条的测试集保持冻结"
@@ -1078,6 +1200,9 @@ def main() -> int:
     path_train = path_axis.build("train")
     path_valid = path_axis.build("valid", dedupe=True)
     path_test = path_axis.build("test", dedupe=True)
+    payload_train = payload_axis.build("train")
+    payload_valid = payload_axis.build("valid", dedupe=True)
+    payload_test = payload_axis.build("test", dedupe=True)
 
     frozen_eval: set[str] = {c for c, _l, _t, _p in env_valid + env_test + path_valid + path_test}
     for extra in [args.holdout, *(args.eval_sets or [])]:
@@ -1167,7 +1292,7 @@ def main() -> int:
         weighted.extend([(command, label, reason)] * args.augment_repeat)
     augment = weighted
 
-    # 作用目标对照组按自己的倍数加进来（默认 1×，理由见 `--env-axis-repeat`）。
+    # 作用目标对照组按自己的目标份额加进来（理由见 `--env-axis-share`）。
     # 放在加权之后，就不会被 `--augment-repeat` 连带放大。
     # reason 以 `_augment` 结尾，才能在标签冲突里赢过上游——上游的口径不区分
     # 本地容器和生产集群，而这正是这组数据要教的东西。
@@ -1175,6 +1300,8 @@ def main() -> int:
                 if c.strip() not in excluded]
     path_rows = [(c, l, "path_axis_augment") for c, l, _t, _p in path_train
                  if c.strip() not in excluded]
+    payload_rows = [(c, l, "payload_axis_augment") for c, l, _t, _p in payload_train
+                    if c.strip() not in excluded]
 
     # 链式样本的素材池要和**训练采样无关**。
     #
@@ -1208,8 +1335,8 @@ def main() -> int:
         stable_rng(args.seed, "chains-bare"),
         0,
         args.chain_bare_danger,
-        styles=("middle", "last", "lines", "lines4", "semi"),
         reason="chain_bare_danger",
+        danger_can_lead=False,
     )
 
     # `base_train`（本地 opencode 导出）也要一起参与冲突消解，它和上游一样
@@ -1225,24 +1352,52 @@ def main() -> int:
     # 两组一起算，所以 rest 是「两组都不算在内」的那部分。
     rest_rows = base_rows + train_safe + train_danger + augment + chains
 
-    def to_share(rows: list, share: float, others: int) -> list:
-        """重复并截断到目标份额。只能整份重复，所以向上取整再截断——
-        反过来（向下取整）会让份额系统性偏低。"""
-        if not rows or share <= 0:
-            return []
-        want = round(others * share / (1 - share))
-        reps = max(1, -(-want // len(rows)))
-        return (rows * reps)[:want]
+    def to_shares(groups: list[tuple[str, list, float]], others: int) -> dict[str, list]:
+        """把**所有**轴一起解到各自的目标份额。
+
+        ⚠️ 必须联立解，不能一根一根算。原来是
+        `want = others * share / (1 - share)`，每根轴都假装自己是唯一的新增，
+        于是三根轴一起上时每根都偏小——实测目标 24/10/6 实得 21.6/7.5/4.3，
+        载荷轴只拿到目标的 72%。
+
+        这是 v14 那个坑的同族。当时两根轴，联立一下就对了；加第三根又塌了，
+        因为公式里的 `1 - share` 只扣了自己那一份。所以这次不是改个系数，是把
+        「有多少根轴」这件事从公式里拿掉：
+
+            T = others / (1 - Σshare)      总量
+            want_i = T * share_i           各轴
+
+        只能整份重复，所以向上取整再截断——反过来（向下取整）会让份额系统性偏低。
+        """
+        total_share = sum(sh for _n, _r, sh in groups)
+        if total_share >= 1:
+            raise SystemExit(f"各轴目标份额合计 {total_share:.0%} ≥ 100%，解不出来")
+        total = others / (1 - total_share)
+        out: dict[str, list] = {}
+        for name, rows, share in groups:
+            if not rows or share <= 0:
+                out[name] = []
+                continue
+            want = round(total * share)
+            reps = max(1, -(-want // len(rows)))
+            out[name] = (rows * reps)[:want]
+        return out
 
     rest = len(rest_rows)
-    env_scaled = to_share(env_rows, args.env_axis_share, rest)
-    path_scaled = to_share(path_rows, args.path_axis_share, rest)
+    scaled = to_shares([
+        ("env", env_rows, args.env_axis_share),
+        ("path", path_rows, args.path_axis_share),
+        ("payload", payload_rows, args.payload_axis_share),
+    ], rest)
+    env_scaled, path_scaled, payload_scaled = scaled["env"], scaled["path"], scaled["payload"]
     print(f"作用目标对照组：{len(env_rows)} → {len(env_scaled)} 行"
           f"（目标 {args.env_axis_share:.0%}），验证 {len(env_valid)} 测试 {len(env_test)}")
     print(f"作用路径对照组：{len(path_rows)} → {len(path_scaled)} 行"
           f"（目标 {args.path_axis_share:.0%}），验证 {len(path_valid)} 测试 {len(path_test)}")
+    print(f"载荷对照组：    {len(payload_rows)} → {len(payload_scaled)} 行"
+          f"（目标 {args.payload_axis_share:.0%}），验证 {len(payload_valid)} 测试 {len(payload_test)}")
 
-    train_extra = rest_rows + env_scaled + path_scaled
+    train_extra = rest_rows + env_scaled + path_scaled + payload_scaled
 
     # 同一条命令被打上不同标签，两条样本会互相抵消——模型学到的是噪声。
     #
@@ -1427,6 +1582,11 @@ def main() -> int:
         [dict(make_sample(prompt, c, l), expected=l, cmd=c, target=t, prox=p)
          for c, l, t, p in path_test],
     )
+    write_jsonl(
+        args.payload_axis_test_output,
+        [dict(make_sample(prompt, c, l), expected=l, cmd=c, target=t, prox=p)
+         for c, l, t, p in payload_test],
+    )
 
     for name, rows in [("train", train), ("valid", valid)]:
         counts = Counter(row["messages"][-1]["content"] for row in rows)
@@ -1434,6 +1594,7 @@ def main() -> int:
 
     check_verb_families(train)
     check_shares(train, args.update_shares)
+    check_shape_balance(train)
 
     # 危险链式的占比是这个项目最容易被无声稀释的东西。
     #
